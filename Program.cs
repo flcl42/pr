@@ -1,11 +1,15 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Collections.Concurrent;
+using System.Data;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32;
 using Spectre.Console;
-using Spectre.Console.Rendering;
+using Tui = Terminal.Gui;
 
 Console.OutputEncoding = Encoding.UTF8;
+TrySetConsoleTitle("PRs");
 try
 {
     Console.TreatControlCAsInput = false;
@@ -23,6 +27,8 @@ Console.CancelKeyPress += (_, args) =>
 
 try
 {
+    LegacyProtocolHandler.TryUnregister();
+
     var commandLine = CommandLine.Parse(args);
     if (commandLine.ShowHelp)
     {
@@ -66,14 +72,19 @@ try
 
     if (commandLine.CleanupOnce)
     {
-        if (settings.Repositories.Count == 0)
+        if (settings.Repositories.Count == 0 && settings.IgnoredPullRequests.Count == 0)
         {
             Console.WriteLine("No tracked repositories. Add one with: pr https://github.com/OWNER/REPO");
             return;
         }
 
-        var result = await new NotificationCleaner(settings.Repositories).CleanupAsync(shutdown.Token);
-        Console.WriteLine($"Scanned {result.Scanned} unread notification(s) from tracked repos; marked {result.MarkedRead} as read.");
+        var result = await new NotificationCleaner(settings.Repositories, settings.IgnoredPullRequests).CleanupAsync(shutdown.Token);
+        if (settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests))
+        {
+            settings.Save();
+        }
+
+        Console.WriteLine($"Scanned {result.Scanned} unread notification(s) from tracked repos; marked {result.MarkedRead} as read; removed {result.RemovedIgnoredPullRequests.Count} closed ignored PR(s).");
         return;
     }
 
@@ -96,6 +107,25 @@ static void PrintUsage()
     Console.Error.WriteLine("  pr --cleanup-once");
 }
 
+static void TrySetConsoleTitle(string title)
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    try
+    {
+        Console.Title = title;
+    }
+    catch (IOException)
+    {
+    }
+    catch (PlatformNotSupportedException)
+    {
+    }
+}
+
 static void PrintRepositoryUpdate(SettingsUpdateResult update, string settingsPath)
 {
     foreach (var repo in update.Added)
@@ -116,6 +146,8 @@ static async Task PrintOnceAsync(AppSettings settings, CancellationToken cancell
     var result = await new GhClient().FetchPullRequestsAsync(
         settings.Repositories,
         settings.RequiredApprovals,
+        settings.IgnoredPullRequestKeys,
+        settings.Priority,
         cancellationToken);
 
     var excludedAuthor = result.ExcludedAuthor is null ? "" : $" excluding @{result.ExcludedAuthor}";
@@ -146,7 +178,9 @@ static async Task PrintOnceAsync(AppSettings settings, CancellationToken cancell
         table.AddRow(
             "",
             "",
-            $"No open non-draft PRs from other authors are currently below {settings.RequiredApprovals} approvals.",
+            settings.IgnoredPullRequests.Count == 0
+                ? $"No open non-draft PRs from other authors are currently below {settings.RequiredApprovals} approvals."
+                : $"No visible open non-draft PRs from other authors are currently below {settings.RequiredApprovals} approvals. Ignored PRs are hidden.",
             "",
             "",
             "");
@@ -156,8 +190,8 @@ static async Task PrintOnceAsync(AppSettings settings, CancellationToken cancell
         foreach (var pr in result.Items)
         {
             table.AddRow(
-                Markup.Escape(pr.Repository.FullName),
-                LinkCell($"#{pr.Number}", pr.Url),
+                Markup.Escape(pr.Repository.Name),
+                PriorityCell($"#{pr.Number}", pr.Priority),
                 LinkCell(pr.Title, pr.Url),
                 Markup.Escape("@" + pr.Author),
                 pr.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture),
@@ -171,25 +205,46 @@ static async Task PrintOnceAsync(AppSettings settings, CancellationToken cancell
     {
         return $"[link={url}][underline blue]{Markup.Escape(value)}[/][/]";
     }
+
+    static string PriorityCell(string value, PullRequestPriority priority)
+    {
+        var color = priority.Heat switch
+        {
+            PullRequestHeat.SuperHot => "red",
+            PullRequestHeat.Hot => "yellow",
+            _ => "green",
+        };
+
+        return $"[{color}]{Markup.Escape(value)}[/]";
+    }
 }
 
 internal sealed class DashboardApp
 {
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromHours(1);
-    private const int FixedLayoutRows = 16;
+    private static readonly IReadOnlySet<string> NoIgnoredPullRequestKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private const int RepoColumn = 0;
+    private const int PullRequestColumn = 1;
+    private const int TitleColumn = 2;
+    private const int AuthorColumn = 3;
+    private const int CreatedColumn = 4;
+    private const int ApprovalColumn = 5;
+    private const int IgnoreColumn = 6;
 
+    private readonly AppSettings _settings;
     private readonly IReadOnlyList<RepositoryRef> _repositories;
     private readonly int _requiredApprovals;
     private readonly string _settingsPath;
     private readonly GhClient _client = new();
-    private readonly NotificationCleaner _notificationCleaner;
     private IReadOnlyList<PullRequestInfo> _items = [];
+    private HashSet<string> _ignoredPullRequestKeys;
     private HashSet<string>? _knownPullRequestKeys;
+    private bool _showIgnoredPullRequests;
     private DateTimeOffset? _lastRefresh;
     private DateTimeOffset _nextRefresh = DateTimeOffset.MinValue;
     private DateTimeOffset? _lastCleanup;
-    private DateTimeOffset _nextCleanup = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextCleanup;
     private string? _error;
     private string? _cleanupError;
     private string? _currentUserLogin;
@@ -197,111 +252,194 @@ internal sealed class DashboardApp
     private int _openNonDraftCount;
     private int _lastCleanupScanned;
     private int _lastCleanupMarkedRead;
-    private int _selectedIndex;
-    private int _scrollOffset;
-    private bool _quit;
+    private int _lastCleanupRemovedIgnored;
+    private int _ignoredPullRequestCount;
+    private DateTime _settingsLastWriteUtc;
 
     public DashboardApp(AppSettings settings)
     {
+        _settings = settings;
         _repositories = settings.Repositories;
         _requiredApprovals = settings.RequiredApprovals;
         _settingsPath = settings.SettingsPath;
-        _notificationCleaner = new NotificationCleaner(_repositories);
+        _ignoredPullRequestKeys = settings.IgnoredPullRequestKeys;
+        _ignoredPullRequestCount = settings.IgnoredPullRequests.Count;
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _nextCleanup = DateTimeOffset.UtcNow.AddSeconds(20);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        var originalCursorVisible = TryGetCursorVisible();
-        if (originalCursorVisible.HasValue)
-        {
-            TrySetCursorVisible(false);
-        }
+        Tui.Application.Init();
+        using var appCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var dashboard = new DashboardView(this);
 
         try
         {
-            Task<FetchResult>? refresh = null;
-            Task<CleanupResult>? cleanup = null;
-            var dirty = true;
+            Tui.Application.Driver.SetCursorVisibility(Tui.CursorVisibility.Invisible);
+            dashboard.Build(Tui.Application.Top);
+            dashboard.Refresh(isRefreshing: _repositories.Count > 0, isCleaning: false);
 
-            while (!_quit && !cancellationToken.IsCancellationRequested)
+            var worker = RunBackgroundLoopAsync(dashboard, appCancellation.Token);
+            using var cancelRegistration = cancellationToken.Register(RequestStop);
+
+            Tui.Application.Run();
+            appCancellation.Cancel();
+
+            try
             {
-                if (refresh is null && DateTimeOffset.UtcNow >= _nextRefresh)
-                {
-                    refresh = _client.FetchPullRequestsAsync(_repositories, _requiredApprovals, cancellationToken);
-                    _error = null;
-                    dirty = true;
-                }
-
-                if (_repositories.Count > 0 && cleanup is null && DateTimeOffset.UtcNow >= _nextCleanup)
-                {
-                    cleanup = _notificationCleaner.CleanupAsync(cancellationToken);
-                    dirty = true;
-                }
-
-                if (refresh is not null && refresh.IsCompleted)
-                {
-                    try
-                    {
-                        ApplyFetchResult(await refresh);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _error = ex.Message;
-                        _nextRefresh = DateTimeOffset.UtcNow.AddSeconds(30);
-                    }
-
-                    refresh = null;
-                    dirty = true;
-                }
-
-                if (cleanup is not null && cleanup.IsCompleted)
-                {
-                    try
-                    {
-                        ApplyCleanupResult(await cleanup);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _cleanupError = ex.Message;
-                        _nextCleanup = DateTimeOffset.UtcNow.AddMinutes(5);
-                    }
-
-                    cleanup = null;
-                    dirty = true;
-                }
-
-                dirty |= HandleKeys(refresh is not null, cleanup is not null);
-
-                if (dirty)
-                {
-                    Render(refresh is not null, cleanup is not null);
-                    dirty = false;
-                }
-
-                try
-                {
-                    await Task.Delay(100, cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
+                await worker;
             }
-
-            AnsiConsole.Clear();
+            catch (OperationCanceledException) when (appCancellation.IsCancellationRequested)
+            {
+            }
         }
         finally
         {
-            if (originalCursorVisible.HasValue)
-            {
-                TrySetCursorVisible(originalCursorVisible.Value);
-            }
+            Tui.Application.Shutdown();
         }
     }
 
-    private void ApplyFetchResult(FetchResult result)
+    private async Task RunBackgroundLoopAsync(DashboardView dashboard, CancellationToken cancellationToken)
     {
-        DingOnNewItems(result.Items);
+        Task<FetchResult>? refresh = null;
+        Task<FetchResult>? priorityRefresh = null;
+        Task<CleanupResult>? cleanup = null;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var startedWork = false;
+
+            if (refresh is null && priorityRefresh is null && DateTimeOffset.UtcNow >= _nextRefresh)
+            {
+                var firstPaintOnly = _lastRefresh is null;
+                refresh = _client.FetchPullRequestsAsync(
+                    _repositories,
+                    _requiredApprovals,
+                    NoIgnoredPullRequestKeys,
+                    _settings.Priority,
+                    cancellationToken,
+                    includePriorityDetails: false,
+                    maxPages: firstPaintOnly ? 1 : null);
+                _error = null;
+                startedWork = true;
+            }
+
+            if ((_repositories.Count > 0 || _settings.IgnoredPullRequests.Count > 0) && cleanup is null && DateTimeOffset.UtcNow >= _nextCleanup)
+            {
+                cleanup = new NotificationCleaner(_repositories, _settings.IgnoredPullRequests).CleanupAsync(cancellationToken);
+                startedWork = true;
+            }
+
+            if (startedWork)
+            {
+                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, cleanup is not null);
+            }
+
+            if (refresh is not null && refresh.IsCompleted)
+            {
+                try
+                {
+                    var result = await refresh;
+                    ApplyFetchResult(result, dingOnNewItems: !result.IsPartial);
+                    if (result.IsPartial)
+                    {
+                        refresh = _client.FetchPullRequestsAsync(
+                            _repositories,
+                            _requiredApprovals,
+                            NoIgnoredPullRequestKeys,
+                            _settings.Priority,
+                            cancellationToken,
+                            includePriorityDetails: false);
+                    }
+                    else
+                    {
+                        priorityRefresh = _client.EnrichPullRequestPrioritiesAsync(
+                            new FetchResult(_items, _openNonDraftCount, _apiCalls, _repositories.Count, _currentUserLogin, IsPartial: false),
+                            _settings.Priority,
+                            cancellationToken);
+                        refresh = null;
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _error = ex.Message;
+                    _nextRefresh = DateTimeOffset.UtcNow.AddSeconds(30);
+                    refresh = null;
+                }
+
+                RefreshOnUi(dashboard, isRefreshing: refresh is not null || priorityRefresh is not null, cleanup is not null);
+            }
+
+            if (priorityRefresh is not null && priorityRefresh.IsCompleted)
+            {
+                try
+                {
+                    ApplyFetchResult(await priorityRefresh, dingOnNewItems: false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _error = $"priority refresh failed: {ex.Message}";
+                }
+
+                priorityRefresh = null;
+                RefreshOnUi(dashboard, refresh is not null, cleanup is not null);
+            }
+
+            if (cleanup is not null && cleanup.IsCompleted)
+            {
+                try
+                {
+                    ApplyCleanupResult(await cleanup);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _cleanupError = ex.Message;
+                    _nextCleanup = DateTimeOffset.UtcNow.AddMinutes(5);
+                }
+
+                cleanup = null;
+                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, isCleaning: false);
+            }
+
+            if (ReloadSettingsIfChanged())
+            {
+                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, cleanup is not null);
+            }
+
+            await Task.Delay(100, cancellationToken);
+        }
+    }
+
+    private static void RequestStop()
+    {
+        try
+        {
+            Tui.Application.MainLoop.Invoke(() => Tui.Application.RequestStop(Tui.Application.Top));
+        }
+        catch
+        {
+        }
+    }
+
+    private static void RefreshOnUi(DashboardView dashboard, bool isRefreshing, bool isCleaning)
+    {
+        try
+        {
+            Tui.Application.MainLoop.Invoke(() => dashboard.Refresh(isRefreshing, isCleaning));
+        }
+        catch
+        {
+        }
+    }
+
+    private void ApplyFetchResult(FetchResult result, bool dingOnNewItems = true)
+    {
+        if (dingOnNewItems)
+        {
+            DingOnNewItems(result.Items);
+        }
+
         _items = result.Items;
         _lastRefresh = DateTimeOffset.UtcNow;
         _nextRefresh = _lastRefresh.Value.Add(RefreshInterval);
@@ -309,21 +447,37 @@ internal sealed class DashboardApp
         _openNonDraftCount = result.OpenNonDraftCount;
         _currentUserLogin = result.ExcludedAuthor;
         _error = null;
-        ClampSelection();
     }
 
     private void ApplyCleanupResult(CleanupResult result)
     {
+        if (_settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests))
+        {
+            _settings.Save();
+            _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+            RefreshIgnoredPullRequests();
+        }
+
         _lastCleanup = DateTimeOffset.UtcNow;
         _nextCleanup = _lastCleanup.Value.Add(CleanupInterval);
         _lastCleanupScanned = result.Scanned;
         _lastCleanupMarkedRead = result.MarkedRead;
+        _lastCleanupRemovedIgnored = result.RemovedIgnoredPullRequests.Count;
         _cleanupError = null;
+    }
+
+    private void RefreshIgnoredPullRequests()
+    {
+        _ignoredPullRequestKeys = _settings.IgnoredPullRequestKeys;
+        _ignoredPullRequestCount = _settings.IgnoredPullRequests.Count;
     }
 
     private void DingOnNewItems(IReadOnlyList<PullRequestInfo> items)
     {
-        var latestKeys = items.Select(item => item.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var latestKeys = items
+            .Where(item => !IsIgnored(item))
+            .Select(item => item.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (_knownPullRequestKeys is not null && latestKeys.Any(key => !_knownPullRequestKeys.Contains(key)))
         {
             NotificationSound.Ding();
@@ -332,183 +486,93 @@ internal sealed class DashboardApp
         _knownPullRequestKeys = latestKeys;
     }
 
-    private bool HandleKeys(bool isRefreshing, bool isCleaning)
+    private bool ReloadSettingsIfChanged()
     {
-        if (Console.IsInputRedirected)
+        var lastWriteUtc = GetSettingsLastWriteUtc();
+        if (lastWriteUtc == _settingsLastWriteUtc)
         {
             return false;
         }
 
-        var dirty = false;
-
-        while (Console.KeyAvailable)
+        _settingsLastWriteUtc = lastWriteUtc;
+        var latest = AppSettings.Load();
+        var changed = false;
+        if (_settings.ReplaceIgnoredPullRequests(latest.IgnoredPullRequests))
         {
-            var key = Console.ReadKey(intercept: true);
-            switch (key.Key)
-            {
-                case ConsoleKey.Q:
-                case ConsoleKey.Escape:
-                    _quit = true;
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.R when !isRefreshing:
-                    _nextRefresh = DateTimeOffset.MinValue;
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.C when _repositories.Count > 0 && !isCleaning:
-                    _nextCleanup = DateTimeOffset.MinValue;
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.UpArrow:
-                case ConsoleKey.K:
-                    MoveSelection(-1);
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.DownArrow:
-                case ConsoleKey.J:
-                    MoveSelection(1);
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.PageUp:
-                    MoveSelection(-VisibleRowCount());
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.PageDown:
-                    MoveSelection(VisibleRowCount());
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.Home:
-                    _selectedIndex = 0;
-                    ClampSelection();
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.End:
-                    _selectedIndex = Math.Max(0, _items.Count - 1);
-                    ClampSelection();
-                    dirty = true;
-                    break;
-
-                case ConsoleKey.Enter:
-                    OpenSelectedPullRequest();
-                    dirty = true;
-                    break;
-            }
+            RefreshIgnoredPullRequests();
+            changed = true;
         }
 
-        return dirty;
+        if (_settings.ReplacePriority(latest.Priority))
+        {
+            RequestRefresh();
+            changed = true;
+        }
+
+        return changed;
     }
 
-    private void MoveSelection(int delta)
+    private IReadOnlyList<PullRequestInfo> GetVisiblePullRequests(string titleSearch = "")
     {
-        if (_items.Count == 0)
+        var search = titleSearch.Trim();
+        var includeIgnored = search.Length > 0 || _showIgnoredPullRequests;
+        var source = includeIgnored
+            ? _items
+            : _items.Where(item => !IsIgnored(item));
+
+        if (search.Length == 0)
         {
-            _selectedIndex = 0;
-            _scrollOffset = 0;
-            return;
+            return source.ToArray();
         }
 
-        _selectedIndex = Math.Clamp(_selectedIndex + delta, 0, _items.Count - 1);
-        ClampSelection();
+        return source
+            .Where(item => item.Title.Contains(search, StringComparison.CurrentCultureIgnoreCase))
+            .ToArray();
     }
 
-    private void ClampSelection()
+    private bool IsIgnored(PullRequestInfo pullRequest)
     {
-        if (_items.Count == 0)
-        {
-            _selectedIndex = 0;
-            _scrollOffset = 0;
-            return;
-        }
-
-        _selectedIndex = Math.Clamp(_selectedIndex, 0, _items.Count - 1);
-        var visibleRows = VisibleRowCount();
-
-        if (_selectedIndex < _scrollOffset)
-        {
-            _scrollOffset = _selectedIndex;
-        }
-        else if (_selectedIndex >= _scrollOffset + visibleRows)
-        {
-            _scrollOffset = _selectedIndex - visibleRows + 1;
-        }
-
-        _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, _items.Count - visibleRows));
+        return _ignoredPullRequestKeys.Contains(pullRequest.Key);
     }
 
-    private void OpenSelectedPullRequest()
+    private bool ToggleIgnored(PullRequestInfo pullRequest)
     {
-        if (_items.Count == 0)
+        if (IsIgnored(pullRequest))
         {
-            return;
+            _settings.RemoveIgnoredPullRequests([IgnoredPullRequest.From(pullRequest)]);
+        }
+        else if (!_settings.AddIgnoredPullRequest(IgnoredPullRequest.From(pullRequest)))
+        {
+            return false;
         }
 
-        PullRequests.OpenUrl(_items[_selectedIndex].Url);
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        RefreshIgnoredPullRequests();
+        return true;
     }
 
-    private void Render(bool isRefreshing, bool isCleaning)
+    private bool ToggleIgnoredVisibility()
     {
-        ClampSelection();
-        AnsiConsole.Clear();
-        AnsiConsole.Write(BuildHeader(isRefreshing, isCleaning));
-        AnsiConsole.Write(BuildPullRequestPanel());
-        AnsiConsole.Write(BuildFooter(isRefreshing, isCleaning));
+        _showIgnoredPullRequests = !_showIgnoredPullRequests;
+        return true;
     }
 
-    private IRenderable BuildHeader(bool isRefreshing, bool isCleaning)
+    private void RequestRefresh()
     {
-        var grid = new Grid().Expand();
-        grid.AddColumn();
-        grid.AddColumn();
+        _nextRefresh = DateTimeOffset.MinValue;
+        _error = null;
+    }
 
-        var status = isRefreshing ? "[yellow]refreshing[/]" : "[green]watching[/]";
-        var lastRefresh = _lastRefresh is null
-            ? "never"
-            : _lastRefresh.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.CurrentCulture);
-        var nextRefresh = isRefreshing
-            ? "now"
-            : _nextRefresh.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture);
-        var lastCleanup = _lastCleanup is null
-            ? "never"
-            : _lastCleanup.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.CurrentCulture);
-        var nextCleanup = _repositories.Count == 0
-            ? "disabled"
-            : isCleaning
-                ? "now"
-                : _nextCleanup.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture);
-        var cleanupText = _repositories.Count == 0
-            ? "no tracked repositories"
-            : _cleanupError is null
-                ? $"{_lastCleanupScanned} scanned, {_lastCleanupMarkedRead} marked read"
-                : $"failed: {_cleanupError}";
+    private void RequestCleanup()
+    {
+        _nextCleanup = DateTimeOffset.MinValue;
+        _cleanupError = null;
+    }
 
-        var scanText = _currentUserLogin is null
-            ? $"{_openNonDraftCount} open non-draft PRs scanned, {_apiCalls} request page(s)"
-            : $"{_openNonDraftCount} open non-draft PRs scanned, excluding @{_currentUserLogin}, {_apiCalls} request page(s)";
-
-        grid.AddRow(
-            new Markup("[bold aqua]GitHub PR Control Panel[/]"),
-            new Markup($"[grey]{Markup.Escape(RepositorySummary())} - {status}[/]"));
-        grid.AddRow(
-            new Markup($"[bold]{_items.Count}[/] PRs below {_requiredApprovals} approvals"),
-            new Markup($"[grey]{Markup.Escape(scanText)}[/]"));
-        grid.AddRow(
-            new Markup($"[grey]Last refresh: {Markup.Escape(lastRefresh)}[/]"),
-            new Markup($"[grey]Next refresh: {Markup.Escape(nextRefresh)}[/]"));
-        grid.AddRow(
-            new Markup($"[grey]Last cleanup: {Markup.Escape(lastCleanup)}[/]"),
-            new Markup($"[grey]Next cleanup: {Markup.Escape(nextCleanup)} - {Markup.Escape(cleanupText)}[/]"));
-
-        return new Panel(grid)
-            .Border(BoxBorder.Rounded)
-            .Expand();
+    private bool CanCleanup()
+    {
+        return _repositories.Count > 0 || _settings.IgnoredPullRequests.Count > 0;
     }
 
     private string RepositorySummary()
@@ -528,64 +592,6 @@ internal sealed class DashboardApp
         return $"{_repositories.Count} repos: {string.Join(", ", names)}{suffix}";
     }
 
-    private IRenderable BuildPullRequestPanel()
-    {
-        var visibleRows = VisibleRowCount();
-        var repoWidth = Math.Clamp(TerminalWidth() / 5, 16, 34);
-        var titleWidth = Math.Clamp(TerminalWidth() - repoWidth - 86, 20, 88);
-        var approverWidth = Math.Clamp(TerminalWidth() - repoWidth - 104, 10, 32);
-
-        var table = new Table()
-            .Border(TableBorder.Rounded)
-            .Expand();
-
-        table.AddColumn(new TableColumn("").NoWrap());
-        table.AddColumn(new TableColumn("[bold]Repo[/]").NoWrap());
-        table.AddColumn(new TableColumn("[bold]PR[/]").NoWrap());
-        table.AddColumn(new TableColumn("[bold]Title[/]"));
-        table.AddColumn(new TableColumn("[bold]Author[/]").NoWrap());
-        table.AddColumn(new TableColumn("[bold]Created[/]").NoWrap());
-        table.AddColumn(new TableColumn("[bold]Approvals[/]").NoWrap());
-
-        if (_items.Count == 0)
-        {
-            var message = EmptyListMessage();
-            table.AddRow(
-                TextCell(""),
-                TextCell(""),
-                TextCell(""),
-                TextCell(message),
-                TextCell(""),
-                TextCell(""),
-                TextCell(""));
-        }
-        else
-        {
-            foreach (var row in VisibleItems(visibleRows))
-            {
-                var isSelected = row.Index == _selectedIndex;
-                var pr = row.Item;
-                var marker = isSelected ? "[black on aqua]>[/]" : "[grey] [/]";
-                table.AddRow(
-                    new Markup(marker),
-                    LinkCell(Truncate(pr.Repository.FullName, repoWidth), pr.Repository.Url),
-                    LinkCell($"#{pr.Number}", pr.Url),
-                    LinkCell(Truncate(pr.Title, titleWidth), pr.Url),
-                    TextCell("@" + pr.Author),
-                    TextCell(pr.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture)),
-                    ApprovalCell(pr, approverWidth));
-            }
-        }
-
-        var range = _items.Count == 0
-            ? "0/0"
-            : $"{_scrollOffset + 1}-{Math.Min(_scrollOffset + visibleRows, _items.Count)}/{_items.Count}";
-        return new Panel(table)
-            .Header($" [bold]Pull requests[/] [grey]{range}[/] ")
-            .Border(BoxBorder.Rounded)
-            .Expand();
-    }
-
     private string EmptyListMessage()
     {
         if (_error is not null)
@@ -598,114 +604,23 @@ internal sealed class DashboardApp
             return $"No tracked repositories. Add one with: pr https://github.com/OWNER/REPO. Settings: {_settingsPath}";
         }
 
-        return $"No open non-draft PRs from other authors are currently below {_requiredApprovals} approvals.";
+        return _ignoredPullRequestCount == 0
+            ? $"No open non-draft PRs from other authors are currently below {_requiredApprovals} approvals."
+            : $"No visible open non-draft PRs from other authors are currently below {_requiredApprovals} approvals. Ignored PRs are hidden.";
     }
 
-    private IRenderable BuildFooter(bool isRefreshing, bool isCleaning)
-    {
-        var refresh = isRefreshing ? "[grey]refreshing...[/]" : "[bold]R[/] refresh";
-        var cleanup = _repositories.Count == 0
-            ? "[grey]C clean disabled[/]"
-            : isCleaning
-                ? "[grey]cleaning...[/]"
-                : "[bold]C[/] clean";
-        var error = _error is null ? "" : $" [red]{Markup.Escape(_error)}[/]";
-        var cleanupError = _cleanupError is null ? "" : $" [red]{Markup.Escape(_cleanupError)}[/]";
-        return new Panel(new Markup(
-                $"[bold]Up/Down[/] scroll  [bold]PgUp/PgDn[/] page  [bold]Enter[/] open PR  {refresh}  {cleanup}  [bold]Q[/] quit{error}{cleanupError}"))
-            .Border(BoxBorder.Rounded)
-            .Expand();
-    }
-
-    private IEnumerable<(int Index, PullRequestInfo Item)> VisibleItems(int visibleRows)
-    {
-        var count = Math.Min(visibleRows, Math.Max(0, _items.Count - _scrollOffset));
-        for (var index = 0; index < count; index++)
-        {
-            var itemIndex = _scrollOffset + index;
-            yield return (itemIndex, _items[itemIndex]);
-        }
-    }
-
-    private int VisibleRowCount()
-    {
-        return Math.Max(1, TerminalHeight() - FixedLayoutRows);
-    }
-
-    private static bool? TryGetCursorVisible()
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return null;
-        }
-
-        try
-        {
-            return Console.CursorVisible;
-        }
-        catch (IOException)
-        {
-            return null;
-        }
-    }
-
-    private static void TrySetCursorVisible(bool visible)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
-        try
-        {
-            Console.CursorVisible = visible;
-        }
-        catch (IOException)
-        {
-        }
-    }
-
-    private static int TerminalWidth()
+    private DateTime GetSettingsLastWriteUtc()
     {
         try
         {
-            return Math.Max(80, Console.WindowWidth);
+            return File.Exists(_settingsPath)
+                ? File.GetLastWriteTimeUtc(_settingsPath)
+                : DateTime.MinValue;
         }
         catch (IOException)
         {
-            return 120;
+            return DateTime.MinValue;
         }
-    }
-
-    private static int TerminalHeight()
-    {
-        try
-        {
-            return Math.Max(20, Console.WindowHeight);
-        }
-        catch (IOException)
-        {
-            return 30;
-        }
-    }
-
-    private static Markup TextCell(string value)
-    {
-        return new Markup(Markup.Escape(value));
-    }
-
-    private static Markup LinkCell(string value, string url)
-    {
-        return new Markup($"[link={url}][underline blue]{Markup.Escape(value)}[/][/]");
-    }
-
-    private Markup ApprovalCell(PullRequestInfo pr, int approverWidth)
-    {
-        var color = pr.ApprovalCount == 0 ? "red" : "yellow";
-        var approvers = pr.Approvers.Count == 0
-            ? "none"
-            : Truncate(string.Join(", ", pr.Approvers), approverWidth);
-        return new Markup($"[{color}]{pr.ApprovalCount}/{_requiredApprovals}[/] [grey]{Markup.Escape(approvers)}[/]");
     }
 
     private static string Truncate(string value, int maxLength)
@@ -721,6 +636,847 @@ internal sealed class DashboardApp
         }
 
         return value[..(maxLength - 3)] + "...";
+    }
+
+    private sealed class DashboardView
+    {
+        private static readonly Tui.ColorScheme GrayScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.Gray, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.White, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.White, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.White, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly Tui.ColorScheme IgnoredScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.Gray, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.Gray, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.White, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly Tui.ColorScheme LinkScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.BrightBlue, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.BrightCyan, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.BrightBlue, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.BrightCyan, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly Tui.ColorScheme RedScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.BrightRed, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.BrightRed, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.BrightRed, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.BrightRed, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly Tui.ColorScheme YellowScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.BrightYellow, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.BrightYellow, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.BrightYellow, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.BrightYellow, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly Tui.ColorScheme GreenScheme = new()
+        {
+            Normal = new Tui.Attribute(Tui.Color.BrightGreen, Tui.Color.Black),
+            Focus = new Tui.Attribute(Tui.Color.BrightGreen, Tui.Color.DarkGray),
+            HotNormal = new Tui.Attribute(Tui.Color.BrightGreen, Tui.Color.Black),
+            HotFocus = new Tui.Attribute(Tui.Color.BrightGreen, Tui.Color.DarkGray),
+            Disabled = new Tui.Attribute(Tui.Color.DarkGray, Tui.Color.Black),
+        };
+
+        private static readonly char[] WaveSymbols = ['.', ':', '-', '=', '+', '*', '#', '%', '@'];
+
+        private readonly DashboardApp _owner;
+        private IReadOnlyList<PullRequestInfo> _visiblePullRequests = [];
+        private ColumnLayout _columns = ColumnLayout.Default;
+        private Tui.View _searchBar = null!;
+        private Tui.TextField _searchField = null!;
+        private ClickableTableView _table = null!;
+        private Tui.View _loadingFrame = null!;
+        private Tui.Label _loadingArt = null!;
+        private Tui.Label _title = null!;
+        private Tui.Label _status = null!;
+        private Tui.Label _summary = null!;
+        private Tui.Label _scan = null!;
+        private Tui.Label _footer = null!;
+        private object? _loadingTimerToken;
+        private int _loadingFrameIndex;
+        private bool _isRefreshing;
+        private bool _isCleaning;
+        private bool _isSearchActive;
+        private bool _suppressSearchChanged;
+        private string _titleSearch = "";
+
+        public DashboardView(DashboardApp owner)
+        {
+            _owner = owner;
+        }
+
+        public void Build(Tui.Toplevel top)
+        {
+            top.ColorScheme = GrayScheme;
+            var window = new Tui.Window("PRs")
+            {
+                X = 0,
+                Y = 0,
+                Width = Tui.Dim.Fill(),
+                Height = Tui.Dim.Fill(),
+                ColorScheme = GrayScheme,
+            };
+
+            var header = new Tui.FrameView("Status")
+            {
+                X = 0,
+                Y = 0,
+                Width = Tui.Dim.Fill(),
+                Height = 4,
+                ColorScheme = GrayScheme,
+            };
+
+            _title = new Tui.Label(1, 0, "GitHub PR Control Panel", false)
+            {
+                Width = Tui.Dim.Percent(45),
+                Height = 1,
+            };
+            _status = new Tui.Label
+            {
+                X = Tui.Pos.Percent(45),
+                Y = 0,
+                Width = Tui.Dim.Fill(),
+                Height = 1,
+                TextAlignment = Tui.TextAlignment.Right,
+            };
+            _summary = new Tui.Label
+            {
+                X = 1,
+                Y = 1,
+                Width = Tui.Dim.Percent(45),
+                Height = 1,
+            };
+            _scan = new Tui.Label
+            {
+                X = Tui.Pos.Percent(45),
+                Y = 1,
+                Width = Tui.Dim.Fill(),
+                Height = 1,
+                TextAlignment = Tui.TextAlignment.Right,
+            };
+
+            header.Add(_title);
+            header.Add(_status);
+            header.Add(_summary);
+            header.Add(_scan);
+
+            _searchBar = new Tui.View
+            {
+                X = 0,
+                Y = Tui.Pos.Bottom(header),
+                Width = Tui.Dim.Fill(),
+                Height = 1,
+                CanFocus = false,
+                ColorScheme = GrayScheme,
+                Visible = false,
+                ClearOnVisibleFalse = true,
+            };
+            var searchLabel = new Tui.Label(1, 0, "Search:", false)
+            {
+                Width = 8,
+                Height = 1,
+            };
+            _searchField = new Tui.TextField("")
+            {
+                X = 9,
+                Y = 0,
+                Width = Tui.Dim.Fill(1),
+                Height = 1,
+                ColorScheme = GrayScheme,
+            };
+            _searchField.TextChanged += _ =>
+            {
+                if (_suppressSearchChanged)
+                {
+                    return;
+                }
+
+                _titleSearch = _searchField.Text.ToString() ?? "";
+                Refresh(_isRefreshing, _isCleaning);
+            };
+            _searchField.KeyPress += HandleKeyPress;
+            _searchBar.Add(searchLabel);
+            _searchBar.Add(_searchField);
+
+            _table = new ClickableTableView
+            {
+                X = 0,
+                Y = Tui.Pos.Bottom(header),
+                Width = Tui.Dim.Fill(),
+                Height = Tui.Dim.Fill(3),
+                FullRowSelect = true,
+                CanFocus = true,
+                ColorScheme = GrayScheme,
+                CellClicked = ActivateCell,
+            };
+            _table.CellActivated += args => ActivateCell(args.Col == IgnoreColumn ? IgnoreColumn : TitleColumn, args.Row);
+            _table.KeyPress += HandleKeyPress;
+
+            _loadingFrame = new Tui.View
+            {
+                X = 0,
+                Y = Tui.Pos.Bottom(header),
+                Width = Tui.Dim.Fill(),
+                Height = Tui.Dim.Fill(3),
+                CanFocus = false,
+                ColorScheme = GrayScheme,
+                Visible = false,
+                ClearOnVisibleFalse = true,
+            };
+            _loadingArt = new Tui.Label
+            {
+                X = 0,
+                Y = 0,
+                Width = Tui.Dim.Fill(),
+                Height = Tui.Dim.Fill(),
+            };
+            _loadingFrame.Add(_loadingArt);
+            _loadingFrame.KeyPress += HandleKeyPress;
+
+            var footerFrame = new Tui.FrameView("Commands")
+            {
+                X = 0,
+                Y = Tui.Pos.AnchorEnd(3),
+                Width = Tui.Dim.Fill(),
+                Height = 3,
+                ColorScheme = GrayScheme,
+            };
+            _footer = new Tui.Label
+            {
+                X = 1,
+                Y = 0,
+                Width = Tui.Dim.Fill(1),
+                Height = 1,
+            };
+            footerFrame.Add(_footer);
+            footerFrame.KeyPress += HandleKeyPress;
+
+            window.Add(header);
+            window.Add(_searchBar);
+            window.Add(_table);
+            window.Add(_loadingFrame);
+            window.Add(footerFrame);
+            window.KeyPress += HandleKeyPress;
+            top.Add(window);
+
+            _table.SetFocus();
+        }
+
+        public void Refresh(bool isRefreshing, bool isCleaning)
+        {
+            _isRefreshing = isRefreshing;
+            _isCleaning = isCleaning;
+            _visiblePullRequests = _owner.GetVisiblePullRequests(_titleSearch);
+            _columns = CalculateColumnLayout();
+            _table.MaxCellWidth = Math.Max(200, _columns.Title);
+
+            _status.Text = $"{_owner.RepositorySummary()} - {(isRefreshing ? "refreshing" : "watching")}";
+            _status.ColorScheme = isRefreshing ? YellowScheme : GreenScheme;
+            _summary.Text = SummaryText();
+            _scan.Text = ScanText();
+            _footer.Text = FooterText();
+            LayoutContentViews();
+
+            if (ShouldShowInitialLoading())
+            {
+                ShowInitialLoading();
+                Tui.Application.Refresh();
+                return;
+            }
+
+            HideInitialLoading();
+
+            var previousRow = _table.SelectedRow;
+            var previousColumn = _table.SelectedColumn;
+            var table = BuildDataTable();
+            _table.Table = table;
+            _table.Style = BuildTableStyle(table);
+
+            if (_visiblePullRequests.Count > 0)
+            {
+                _table.SelectedRow = Math.Clamp(previousRow, 0, _visiblePullRequests.Count - 1);
+                _table.SelectedColumn = Math.Clamp(previousColumn, 0, IgnoreColumn);
+            }
+            else
+            {
+                _table.SelectedRow = 0;
+                _table.SelectedColumn = 0;
+            }
+
+            _table.Update();
+            _table.SetNeedsDisplay();
+            Tui.Application.Refresh();
+        }
+
+        private bool ShouldShowInitialLoading()
+        {
+            return _isRefreshing
+                && _owner._lastRefresh is null
+                && _owner._repositories.Count > 0;
+        }
+
+        private void ShowInitialLoading()
+        {
+            _table.Visible = false;
+            _loadingFrame.Visible = true;
+            LayoutContentViews();
+            _summary.Text = "first refresh in progress";
+            _scan.Text = "fetching PRs, reviews, comments, and review requests";
+            UpdateLoadingArt();
+            EnsureLoadingTimer();
+            _loadingFrame.SetNeedsDisplay();
+        }
+
+        private void HideInitialLoading()
+        {
+            _loadingFrame.Visible = false;
+            _table.Visible = true;
+            LayoutContentViews();
+            StopLoadingTimer();
+        }
+
+        private void LayoutContentViews()
+        {
+            _searchBar.Visible = _isSearchActive;
+            var contentY = _isSearchActive
+                ? Tui.Pos.Bottom(_searchBar)
+                : _searchBar.Y;
+            _table.Y = contentY;
+            _loadingFrame.Y = contentY;
+        }
+
+        private void EnsureLoadingTimer()
+        {
+            if (_loadingTimerToken is not null)
+            {
+                return;
+            }
+
+            _loadingTimerToken = Tui.Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(180), _ =>
+            {
+                if (!ShouldShowInitialLoading())
+                {
+                    _loadingTimerToken = null;
+                    return false;
+                }
+
+                _loadingFrameIndex++;
+                UpdateLoadingArt();
+                Tui.Application.Refresh();
+                return true;
+            });
+        }
+
+        private void StopLoadingTimer()
+        {
+            if (_loadingTimerToken is null)
+            {
+                return;
+            }
+
+            Tui.Application.MainLoop.RemoveTimeout(_loadingTimerToken);
+            _loadingTimerToken = null;
+        }
+
+        private void UpdateLoadingArt()
+        {
+            _loadingArt.Text = BuildLoadingWaveArt();
+            _loadingArt.SetNeedsDisplay();
+        }
+
+        private string BuildLoadingWaveArt()
+        {
+            var width = _loadingFrame.Bounds.Width > 0
+                ? Math.Max(24, _loadingFrame.Bounds.Width)
+                : 76;
+            var height = _loadingFrame.Bounds.Height > 0
+                ? Math.Max(6, _loadingFrame.Bounds.Height)
+                : 18;
+            var phase = _loadingFrameIndex * 0.55;
+            var builder = new StringBuilder(height * (width + 1));
+            for (var row = 0; row < height; row++)
+            {
+                var rowPhase = row * 0.38;
+                for (var column = 0; column < width; column++)
+                {
+                    var x = column * 0.17;
+                    var diagonal = (column + row) * 0.055;
+                    var primary = Math.Sin(x + rowPhase - phase);
+                    var secondary = Math.Sin((column * 0.07) - (row * 0.31) - (phase * 0.7));
+                    var swell = Math.Sin(diagonal - (phase * 0.42));
+                    var surface = ((primary * 0.62) + (secondary * 0.26) + (swell * 0.12) + 1.0) / 2.0;
+                    var symbol = Math.Clamp(surface, 0.0, 1.0);
+                    var symbolIndex = (int)Math.Round(symbol * (WaveSymbols.Length - 1));
+                    builder.Append(WaveSymbols[symbolIndex]);
+                }
+
+                if (row < height - 1)
+                {
+                    builder.AppendLine();
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private DataTable BuildDataTable()
+        {
+            var table = new DataTable();
+            table.Columns.Add(FitCell("Repo", _columns.Repo));
+            table.Columns.Add(FitCell("PR", _columns.PullRequest));
+            table.Columns.Add(FitCell("Title", _columns.Title));
+            table.Columns.Add(FitCell("Author", _columns.Author));
+            table.Columns.Add(FitCell("Created", _columns.Created));
+            table.Columns.Add(FitCell("Approvals", _columns.Approval));
+            table.Columns.Add(FitCell("Ignore", _columns.Ignore));
+
+            if (_visiblePullRequests.Count == 0)
+            {
+                var message = _isRefreshing && _owner._repositories.Count > 0
+                    ? ""
+                    : _owner.EmptyListMessage();
+
+                table.Rows.Add(
+                    FitCell("", _columns.Repo),
+                    FitCell("", _columns.PullRequest),
+                    FitCell(message, _columns.Title),
+                    FitCell("", _columns.Author),
+                    FitCell("", _columns.Created),
+                    FitCell("", _columns.Approval),
+                    FitCell("", _columns.Ignore));
+                return table;
+            }
+
+            foreach (var pullRequest in _visiblePullRequests)
+            {
+                var approvers = pullRequest.Approvers.Count == 0
+                    ? "none"
+                    : Truncate(string.Join(", ", pullRequest.Approvers), 36);
+                var title = _owner.IsIgnored(pullRequest)
+                    ? $"(ignored) {pullRequest.Title}"
+                    : pullRequest.Title;
+
+                table.Rows.Add(
+                    FitCell(pullRequest.Repository.Name, _columns.Repo),
+                    FitCell($"#{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}", _columns.PullRequest),
+                    FitCell(title, _columns.Title, underline: true),
+                    FitCell("@" + pullRequest.Author, _columns.Author),
+                    FitCell(pullRequest.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture), _columns.Created),
+                    FitCell($"{pullRequest.ApprovalCount.ToString(CultureInfo.InvariantCulture)}/{_owner._requiredApprovals.ToString(CultureInfo.InvariantCulture)} {approvers}", _columns.Approval),
+                    FitCell(_owner.IsIgnored(pullRequest) ? "unignore" : "ignore", _columns.Ignore, Tui.TextAlignment.Centered));
+            }
+
+            return table;
+        }
+
+        private Tui.TableView.TableStyle BuildTableStyle(DataTable table)
+        {
+            var style = new Tui.TableView.TableStyle
+            {
+                AlwaysShowHeaders = true,
+                ShowHorizontalHeaderUnderline = true,
+                ShowVerticalCellLines = true,
+                ShowHorizontalScrollIndicators = false,
+                ExpandLastColumn = false,
+                RowColorGetter = args => args.RowIndex >= 0
+                    && args.RowIndex < _visiblePullRequests.Count
+                    && _owner.IsIgnored(_visiblePullRequests[args.RowIndex])
+                        ? IgnoredScheme
+                        : GrayScheme,
+            };
+
+            style.ColumnStyles[table.Columns[RepoColumn]!] = FixedColumn(_columns.Repo);
+            style.ColumnStyles[table.Columns[PullRequestColumn]!] = FixedColumn(_columns.PullRequest, PullRequestColor);
+            style.ColumnStyles[table.Columns[TitleColumn]!] = FixedColumn(_columns.Title, LinkColor);
+            style.ColumnStyles[table.Columns[AuthorColumn]!] = FixedColumn(_columns.Author);
+            style.ColumnStyles[table.Columns[CreatedColumn]!] = FixedColumn(_columns.Created);
+            style.ColumnStyles[table.Columns[ApprovalColumn]!] = FixedColumn(_columns.Approval, ApprovalColor);
+            style.ColumnStyles[table.Columns[IgnoreColumn]!] = new Tui.TableView.ColumnStyle
+            {
+                MinWidth = _columns.Ignore,
+                MaxWidth = _columns.Ignore,
+                MinAcceptableWidth = _columns.Ignore,
+                Alignment = Tui.TextAlignment.Centered,
+                ColorGetter = _ => GrayScheme,
+            };
+
+            return style;
+        }
+
+        private ColumnLayout CalculateColumnLayout()
+        {
+            var tableWidth = _table.Bounds.Width > 0
+                ? _table.Bounds.Width
+                : Math.Max(80, Tui.Application.Driver.Cols - 4);
+            tableWidth = Math.Max(80, tableWidth);
+
+            const int separatorWidth = 6;
+            var extra = Math.Max(0, tableWidth - 80);
+            var repo = 12 + Math.Min(12, extra / 8);
+            var pullRequest = 8;
+            var author = 10 + Math.Min(8, extra / 10);
+            var created = 12 + Math.Min(6, extra / 6);
+            var approval = 10 + Math.Min(12, extra / 12);
+            var ignore = 10;
+            var title = Math.Max(12, tableWidth - separatorWidth - repo - pullRequest - author - created - approval - ignore);
+            return new ColumnLayout(repo, pullRequest, title, author, created, approval, ignore);
+        }
+
+        private static Tui.TableView.ColumnStyle FixedColumn(
+            int width,
+            Tui.TableView.CellColorGetterDelegate? colorGetter = null)
+        {
+            return new Tui.TableView.ColumnStyle
+            {
+                MinWidth = width,
+                MaxWidth = width,
+                MinAcceptableWidth = width,
+                ColorGetter = colorGetter,
+            };
+        }
+
+        private Tui.ColorScheme ApprovalColor(Tui.TableView.CellColorGetterArgs args)
+        {
+            if (args.RowIndex < 0 || args.RowIndex >= _visiblePullRequests.Count)
+            {
+                return GrayScheme;
+            }
+
+            return _visiblePullRequests[args.RowIndex].ApprovalCount == 0
+                ? RedScheme
+                : YellowScheme;
+        }
+
+        private Tui.ColorScheme LinkColor(Tui.TableView.CellColorGetterArgs args)
+        {
+            if (args.RowIndex < 0)
+            {
+                return GrayScheme;
+            }
+
+            return args.RowIndex < _visiblePullRequests.Count
+                && _owner.IsIgnored(_visiblePullRequests[args.RowIndex])
+                    ? IgnoredScheme
+                    : LinkScheme;
+        }
+
+        private Tui.ColorScheme PullRequestColor(Tui.TableView.CellColorGetterArgs args)
+        {
+            if (args.RowIndex < 0 || args.RowIndex >= _visiblePullRequests.Count)
+            {
+                return GrayScheme;
+            }
+
+            if (_owner.IsIgnored(_visiblePullRequests[args.RowIndex]))
+            {
+                return IgnoredScheme;
+            }
+
+            return _visiblePullRequests[args.RowIndex].Priority.Heat switch
+            {
+                PullRequestHeat.SuperHot => RedScheme,
+                PullRequestHeat.Hot => YellowScheme,
+                _ => GreenScheme,
+            };
+        }
+
+        private static string FitCell(
+            string value,
+            int width,
+            Tui.TextAlignment alignment = Tui.TextAlignment.Left,
+            bool underline = false)
+        {
+            var innerWidth = Math.Max(0, width - 2);
+            var text = Truncate(NormalizeCell(value), innerWidth);
+            var displayText = underline ? Underline(text) : text;
+            var leftPadding = 1;
+            var rightPadding = 1;
+
+            if (alignment == Tui.TextAlignment.Centered && text.Length < innerWidth)
+            {
+                var remaining = innerWidth - text.Length;
+                leftPadding += remaining / 2;
+                rightPadding += remaining - remaining / 2;
+            }
+            else
+            {
+                rightPadding += Math.Max(0, innerWidth - text.Length);
+            }
+
+            return new string(' ', leftPadding) + displayText + new string(' ', rightPadding);
+        }
+
+        private static string Underline(string value)
+        {
+            if (value.Length == 0)
+            {
+                return value;
+            }
+
+            var builder = new StringBuilder(value.Length * 2);
+            foreach (var character in value)
+            {
+                builder.Append(character);
+                if (!char.IsWhiteSpace(character))
+                {
+                    builder.Append('\u0332');
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private static string NormalizeCell(string value)
+        {
+            return value
+                .Replace('\r', ' ')
+                .Replace('\n', ' ')
+                .Trim();
+        }
+
+        private string ScanText()
+        {
+            var scanText = _owner._currentUserLogin is null
+                ? $"{_owner._openNonDraftCount} open non-draft PRs scanned, {_owner._apiCalls} request page(s)"
+                : $"{_owner._openNonDraftCount} open non-draft PRs scanned, excluding @{_owner._currentUserLogin}, {_owner._apiCalls} request page(s)";
+            if (_owner._ignoredPullRequestCount > 0)
+            {
+                scanText += $", {_owner._ignoredPullRequestCount} ignored";
+            }
+
+            return scanText;
+        }
+
+        private string SummaryText()
+        {
+            var search = _titleSearch.Trim();
+            if (search.Length > 0)
+            {
+                return $"{_visiblePullRequests.Count} title match(es) for \"{Truncate(search, 32)}\"; ignored included";
+            }
+
+            return $"{_visiblePullRequests.Count} visible PRs below {_owner._requiredApprovals} approvals";
+        }
+
+        private string FooterText()
+        {
+            var ignore = _visiblePullRequests.Count == 0
+                ? "I ignore disabled"
+                : SelectedPullRequest() is { } selected && _owner.IsIgnored(selected)
+                    ? "I unignore"
+                    : "I ignore";
+            var reveal = _owner._showIgnoredPullRequests ? "Ctrl+I hide ignored" : "Ctrl+I show ignored";
+            var refresh = _isRefreshing ? "refreshing..." : "R refresh";
+            var cleanup = !_owner.CanCleanup()
+                ? "C clean disabled"
+                : _isCleaning
+                    ? "cleaning..."
+                    : "C clean";
+            var errors = string.Join(" ", new[] { _owner._error, _owner._cleanupError }.Where(error => !string.IsNullOrWhiteSpace(error)));
+            var suffix = string.IsNullOrWhiteSpace(errors) ? "" : $"  {errors}";
+            var search = string.IsNullOrWhiteSpace(_titleSearch)
+                ? (_isSearchActive ? "Esc cancel search" : "F1 search")
+                : $"F1 search '{Truncate(_titleSearch, 20)}'  Esc cancel search";
+            return $"Up/Down scroll  Enter open  Click Title open  Click Ignore toggle  {ignore}  {reveal}  {search}  {refresh}  {cleanup}  Q quit{suffix}";
+        }
+
+        private PullRequestInfo? SelectedPullRequest()
+        {
+            var row = _table.SelectedRow;
+            return row >= 0 && row < _visiblePullRequests.Count
+                ? _visiblePullRequests[row]
+                : null;
+        }
+
+        private void HandleKeyPress(Tui.View.KeyEventEventArgs args)
+        {
+            var key = BaseKey(args.KeyEvent.Key);
+            var isCtrl = args.KeyEvent.IsCtrl || HasModifier(args.KeyEvent.Key, Tui.Key.CtrlMask);
+
+            if (key == Tui.Key.Esc && _isSearchActive)
+            {
+                CancelSearch();
+                args.Handled = true;
+                return;
+            }
+
+            if (_isSearchActive && _searchField.HasFocus)
+            {
+                return;
+            }
+
+            if (key == Tui.Key.Q || key == Tui.Key.q || key == Tui.Key.Esc)
+            {
+                RequestStop();
+                args.Handled = true;
+                return;
+            }
+
+            if (key == Tui.Key.Tab || (isCtrl && (key == Tui.Key.I || key == Tui.Key.i)))
+            {
+                _owner.ToggleIgnoredVisibility();
+                Refresh(_isRefreshing, _isCleaning);
+                args.Handled = true;
+                return;
+            }
+
+            if (key == Tui.Key.F1)
+            {
+                BeginSearch();
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.I || key == Tui.Key.i))
+            {
+                ToggleSelected();
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.R || key == Tui.Key.r) && !_isRefreshing)
+            {
+                _owner.RequestRefresh();
+                Refresh(_isRefreshing, _isCleaning);
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.C || key == Tui.Key.c) && !_isCleaning && _owner.CanCleanup())
+            {
+                _owner.RequestCleanup();
+                Refresh(_isRefreshing, _isCleaning);
+                args.Handled = true;
+            }
+        }
+
+        private void BeginSearch()
+        {
+            _isSearchActive = true;
+            _suppressSearchChanged = true;
+            _searchField.Text = _titleSearch;
+            _suppressSearchChanged = false;
+            Refresh(_isRefreshing, _isCleaning);
+            _searchField.SetFocus();
+        }
+
+        private void CancelSearch()
+        {
+            _isSearchActive = false;
+            _titleSearch = "";
+            _suppressSearchChanged = true;
+            _searchField.Text = "";
+            _suppressSearchChanged = false;
+            Refresh(_isRefreshing, _isCleaning);
+            _table.SetFocus();
+        }
+
+        private void ActivateCell(int column, int row)
+        {
+            if (row < 0 || row >= _visiblePullRequests.Count)
+            {
+                return;
+            }
+
+            var pullRequest = _visiblePullRequests[row];
+            switch (column)
+            {
+                case TitleColumn:
+                    PullRequests.OpenUrl(pullRequest.Url);
+                    break;
+
+                case IgnoreColumn:
+                    if (_owner.ToggleIgnored(pullRequest))
+                    {
+                        Refresh(_isRefreshing, _isCleaning);
+                    }
+
+                    break;
+            }
+        }
+
+        private void ToggleSelected()
+        {
+            var selected = SelectedPullRequest();
+            if (selected is null)
+            {
+                return;
+            }
+
+            if (_owner.ToggleIgnored(selected))
+            {
+                Refresh(_isRefreshing, _isCleaning);
+            }
+        }
+
+        private static Tui.Key BaseKey(Tui.Key key)
+        {
+            return key & ~(Tui.Key.CtrlMask | Tui.Key.AltMask | Tui.Key.ShiftMask);
+        }
+
+        private static bool HasModifier(Tui.Key key, Tui.Key modifier)
+        {
+            return (key & modifier) == modifier;
+        }
+
+        private readonly record struct ColumnLayout(
+            int Repo,
+            int PullRequest,
+            int Title,
+            int Author,
+            int Created,
+            int Approval,
+            int Ignore)
+        {
+            public static ColumnLayout Default { get; } = new(12, 8, 20, 10, 12, 10, 10);
+        }
+    }
+
+    private sealed class ClickableTableView : Tui.TableView
+    {
+        public Action<int, int>? CellClicked { get; init; }
+
+        public override bool MouseEvent(Tui.MouseEvent mouseEvent)
+        {
+            var handled = base.MouseEvent(mouseEvent);
+            if (!HasFlag(mouseEvent.Flags, Tui.MouseFlags.Button1Clicked))
+            {
+                return handled;
+            }
+
+            var cell = ScreenToCell(mouseEvent.X, mouseEvent.Y);
+            if (!cell.HasValue)
+            {
+                return handled;
+            }
+
+            SetSelection(cell.Value.X, cell.Value.Y, extendExistingSelection: false);
+            CellClicked?.Invoke(cell.Value.X, cell.Value.Y);
+            mouseEvent.Handled = true;
+            return true;
+        }
+
+        private static bool HasFlag(Tui.MouseFlags flags, Tui.MouseFlags flag)
+        {
+            return (flags & flag) == flag;
+        }
     }
 }
 
@@ -741,6 +1497,7 @@ internal sealed class GhClient
             nodes {
               ... on PullRequest {
                 number
+                id
                 title
                 url
                 createdAt
@@ -751,7 +1508,7 @@ internal sealed class GhClient
                   nameWithOwner
                   url
                 }
-                latestOpinionatedReviews(first: 100) {
+                latestOpinionatedReviews(first: 20) {
                   nodes {
                     state
                     author {
@@ -768,39 +1525,199 @@ internal sealed class GhClient
     public async Task<FetchResult> FetchPullRequestsAsync(
         IReadOnlyList<RepositoryRef> repositories,
         int requiredApprovals,
-        CancellationToken cancellationToken)
+        IReadOnlySet<string> ignoredPullRequestKeys,
+        PrioritySettings priority,
+        CancellationToken cancellationToken,
+        bool includePriorityDetails = true,
+        int? maxPages = null)
     {
         if (repositories.Count == 0)
         {
-            return new FetchResult([], 0, 0, 0, null);
+            return new FetchResult([], 0, 0, 0, null, IsPartial: false);
         }
 
         var excludedAuthor = await GetCurrentUserLoginAsync(cancellationToken);
         var items = new List<PullRequestInfo>();
         var apiCalls = 0;
         var openNonDraftCount = 0;
+        var isPartial = false;
 
         foreach (var batch in CreateSearchBatches(repositories, excludedAuthor))
         {
-            var batchResult = await FetchPullRequestBatchAsync(batch, requiredApprovals, excludedAuthor, cancellationToken);
+            var batchResult = await FetchPullRequestBatchAsync(batch, requiredApprovals, ignoredPullRequestKeys, excludedAuthor, priority, DateTimeOffset.UtcNow, cancellationToken, maxPages);
             items.AddRange(batchResult.Items);
             apiCalls += batchResult.ApiCalls;
             openNonDraftCount += batchResult.OpenNonDraftCount;
+            isPartial |= batchResult.IsPartial;
         }
 
-        return new FetchResult(
+        var result = new FetchResult(
             items.OrderByDescending(item => item.CreatedAt).ToArray(),
             openNonDraftCount,
             apiCalls,
             repositories.Count,
-            excludedAuthor);
+            excludedAuthor,
+            isPartial);
+
+        return includePriorityDetails
+            ? await EnrichPullRequestPrioritiesAsync(result, priority, cancellationToken)
+            : result;
+    }
+
+    public async Task<FetchResult> EnrichPullRequestPrioritiesAsync(
+        FetchResult result,
+        PrioritySettings priority,
+        CancellationToken cancellationToken)
+    {
+        if (result.Items.Count == 0)
+        {
+            return result;
+        }
+
+        var chunks = result.Items
+            .Where(item => !string.IsNullOrWhiteSpace(item.NodeId))
+            .Chunk(20)
+            .ToArray();
+        if (chunks.Length == 0)
+        {
+            return result;
+        }
+
+        var priorities = new ConcurrentDictionary<string, PullRequestPriority>(StringComparer.Ordinal);
+        var apiCalls = 0;
+        var now = DateTimeOffset.UtcNow;
+
+        await Parallel.ForEachAsync(
+            chunks,
+            new ParallelOptions
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = 4,
+            },
+            async (chunk, token) =>
+            {
+                var details = await FetchPriorityDetailsChunkAsync(chunk, priority, result.ExcludedAuthor, now, token);
+                Interlocked.Increment(ref apiCalls);
+                foreach (var detail in details)
+                {
+                    priorities[detail.NodeId] = detail.Priority;
+                }
+            });
+
+        var items = result.Items
+            .Select(item => priorities.TryGetValue(item.NodeId, out var updatedPriority)
+                ? item with { Priority = updatedPriority }
+                : item)
+            .ToArray();
+
+        return result with
+        {
+            Items = items,
+            ApiCalls = result.ApiCalls + apiCalls,
+        };
+    }
+
+    private static async Task<IReadOnlyList<PriorityDetail>> FetchPriorityDetailsChunkAsync(
+        PullRequestInfo[] pullRequests,
+        PrioritySettings priority,
+        string? currentUserLogin,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        using var document = await RunGraphQlQueryAsync(BuildPriorityDetailsQuery(pullRequests), cancellationToken);
+        var data = document.RootElement.GetProperty("data");
+        var details = new List<PriorityDetail>(pullRequests.Length);
+
+        for (var index = 0; index < pullRequests.Length; index++)
+        {
+            var alias = $"pr{index.ToString(CultureInfo.InvariantCulture)}";
+            if (!data.TryGetProperty(alias, out var node)
+                || node.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                continue;
+            }
+
+            var pullRequest = pullRequests[index];
+            var nodeId = node.TryGetProperty("id", out var idProperty)
+                ? idProperty.GetString() ?? pullRequest.NodeId
+                : pullRequest.NodeId;
+            var reviewRequestedFromUser = pullRequest.Priority.ReviewRequestedFromUser
+                || (!string.IsNullOrWhiteSpace(currentUserLogin)
+                    && ReviewRequestedUsers(node).Contains(currentUserLogin, StringComparer.OrdinalIgnoreCase));
+            var updatedPriority = CalculatePriority(
+                node,
+                pullRequest.Author,
+                pullRequest.CreatedAt,
+                reviewRequestedFromUser,
+                priority,
+                now);
+            details.Add(new PriorityDetail(nodeId, updatedPriority));
+        }
+
+        return details;
+    }
+
+    private static string BuildPriorityDetailsQuery(IReadOnlyList<PullRequestInfo> pullRequests)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("query {");
+        for (var index = 0; index < pullRequests.Count; index++)
+        {
+            builder
+                .Append("  pr")
+                .Append(index.ToString(CultureInfo.InvariantCulture))
+                .Append(": node(id: ")
+                .Append(JsonSerializer.Serialize(pullRequests[index].NodeId))
+                .AppendLine(") {");
+            builder.AppendLine("    ... on PullRequest {");
+            builder.AppendLine("      id");
+            builder.AppendLine("      comments(first: 50) {");
+            builder.AppendLine("        nodes {");
+            builder.AppendLine("          author {");
+            builder.AppendLine("            login");
+            builder.AppendLine("          }");
+            builder.AppendLine("        }");
+            builder.AppendLine("      }");
+            builder.AppendLine("      reviews(first: 50) {");
+            builder.AppendLine("        nodes {");
+            builder.AppendLine("          author {");
+            builder.AppendLine("            login");
+            builder.AppendLine("          }");
+            builder.AppendLine("          comments(first: 20) {");
+            builder.AppendLine("            nodes {");
+            builder.AppendLine("              author {");
+            builder.AppendLine("                login");
+            builder.AppendLine("              }");
+            builder.AppendLine("            }");
+            builder.AppendLine("          }");
+            builder.AppendLine("        }");
+            builder.AppendLine("      }");
+            builder.AppendLine("      reviewRequests(first: 100) {");
+            builder.AppendLine("        nodes {");
+            builder.AppendLine("          requestedReviewer {");
+            builder.AppendLine("            ... on User {");
+            builder.AppendLine("              login");
+            builder.AppendLine("            }");
+            builder.AppendLine("          }");
+            builder.AppendLine("        }");
+            builder.AppendLine("      }");
+            builder.AppendLine("    }");
+            builder.AppendLine("  }");
+        }
+
+        builder.AppendLine("}");
+        return builder.ToString();
     }
 
     private static async Task<FetchResult> FetchPullRequestBatchAsync(
         IReadOnlyList<RepositoryRef> repositories,
         int requiredApprovals,
+        IReadOnlySet<string> ignoredPullRequestKeys,
         string? excludedAuthor,
-        CancellationToken cancellationToken)
+        PrioritySettings priority,
+        DateTimeOffset now,
+        CancellationToken cancellationToken,
+        int? maxPages)
     {
         var searchText = BuildSearchText(repositories, excludedAuthor);
         var items = new List<PullRequestInfo>();
@@ -809,7 +1726,7 @@ internal sealed class GhClient
         var apiCalls = 0;
         var openNonDraftCount = 0;
 
-        while (hasNextPage)
+        while (hasNextPage && (!maxPages.HasValue || apiCalls < maxPages.Value))
         {
             apiCalls++;
             using var page = await RunGraphQlPageAsync(searchText, cursor, cancellationToken);
@@ -822,8 +1739,13 @@ internal sealed class GhClient
 
             foreach (var node in search.GetProperty("nodes").EnumerateArray())
             {
-                var pr = ParsePullRequest(node);
+                var pr = ParsePullRequest(node, excludedAuthor, priority, now);
                 if (string.Equals(pr.Author, excludedAuthor, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (ignoredPullRequestKeys.Contains(pr.Key))
                 {
                     continue;
                 }
@@ -839,7 +1761,7 @@ internal sealed class GhClient
             cursor = hasNextPage ? pageInfo.GetProperty("endCursor").GetString() : null;
         }
 
-        return new FetchResult(items, openNonDraftCount, apiCalls, repositories.Count, excludedAuthor);
+        return new FetchResult(items, openNonDraftCount, apiCalls, repositories.Count, excludedAuthor, IsPartial: hasNextPage);
     }
 
     private static IReadOnlyList<IReadOnlyList<RepositoryRef>> CreateSearchBatches(
@@ -905,9 +1827,18 @@ internal sealed class GhClient
         return _currentUserLogin;
     }
 
-    private static PullRequestInfo ParsePullRequest(JsonElement node)
+    private static PullRequestInfo ParsePullRequest(
+        JsonElement node,
+        string? currentUserLogin,
+        PrioritySettings prioritySettings,
+        DateTimeOffset now)
     {
         var repository = ParseRepository(node.GetProperty("repository"));
+        var author = node.GetProperty("author").GetProperty("login").GetString() ?? "unknown";
+        var createdAt = DateTimeOffset.Parse(
+            node.GetProperty("createdAt").GetString() ?? "",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal);
         var approvers = node
             .GetProperty("latestOpinionatedReviews")
             .GetProperty("nodes")
@@ -919,18 +1850,133 @@ internal sealed class GhClient
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Order(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        var reviewRequestedFromUser = !string.IsNullOrWhiteSpace(currentUserLogin)
+            && ReviewRequestedUsers(node).Contains(currentUserLogin, StringComparer.OrdinalIgnoreCase);
+        var priority = CalculatePriority(node, author, createdAt, reviewRequestedFromUser, prioritySettings, now);
 
         return new PullRequestInfo(
+            node.GetProperty("id").GetString() ?? "",
             repository,
             node.GetProperty("number").GetInt32(),
             node.GetProperty("title").GetString() ?? "(untitled)",
-            node.GetProperty("author").GetProperty("login").GetString() ?? "unknown",
+            author,
             node.GetProperty("url").GetString() ?? "",
-            DateTimeOffset.Parse(
-                node.GetProperty("createdAt").GetString() ?? "",
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal),
-            approvers);
+            createdAt,
+            approvers,
+            priority);
+    }
+
+    private static PullRequestPriority CalculatePriority(
+        JsonElement node,
+        string author,
+        DateTimeOffset createdAt,
+        bool reviewRequestedFromUser,
+        PrioritySettings prioritySettings,
+        DateTimeOffset now)
+    {
+        return prioritySettings.Calculate(
+            createdAt,
+            author,
+            CommentAuthors(node),
+            ReviewAuthors(node),
+            reviewRequestedFromUser,
+            now);
+    }
+
+    private static IEnumerable<string> CommentAuthors(JsonElement node)
+    {
+        if (node.TryGetProperty("comments", out var comments)
+            && comments.TryGetProperty("nodes", out var commentNodes))
+        {
+            foreach (var comment in commentNodes.EnumerateArray())
+            {
+                if (TryGetLogin(comment, out var login))
+                {
+                    yield return login;
+                }
+            }
+        }
+
+        if (!node.TryGetProperty("reviews", out var reviews)
+            || !reviews.TryGetProperty("nodes", out var reviewNodes))
+        {
+            yield break;
+        }
+
+        foreach (var review in reviewNodes.EnumerateArray())
+        {
+            if (!review.TryGetProperty("comments", out var reviewComments)
+                || !reviewComments.TryGetProperty("nodes", out var reviewCommentNodes))
+            {
+                continue;
+            }
+
+            foreach (var comment in reviewCommentNodes.EnumerateArray())
+            {
+                if (TryGetLogin(comment, out var login))
+                {
+                    yield return login;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> ReviewAuthors(JsonElement node)
+    {
+        if (!node.TryGetProperty("reviews", out var reviews)
+            || !reviews.TryGetProperty("nodes", out var reviewNodes))
+        {
+            yield break;
+        }
+
+        foreach (var review in reviewNodes.EnumerateArray())
+        {
+            if (TryGetLogin(review, out var login))
+            {
+                yield return login;
+            }
+        }
+    }
+
+    private static IEnumerable<string> ReviewRequestedUsers(JsonElement node)
+    {
+        if (!node.TryGetProperty("reviewRequests", out var reviewRequests)
+            || !reviewRequests.TryGetProperty("nodes", out var requestNodes))
+        {
+            yield break;
+        }
+
+        foreach (var request in requestNodes.EnumerateArray())
+        {
+            if (!request.TryGetProperty("requestedReviewer", out var reviewer)
+                || reviewer.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+                || !reviewer.TryGetProperty("login", out var login)
+                || login.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+
+            var value = login.GetString();
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                yield return value;
+            }
+        }
+    }
+
+    private static bool TryGetLogin(JsonElement element, out string login)
+    {
+        login = "";
+        if (!element.TryGetProperty("author", out var author)
+            || author.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+            || !author.TryGetProperty("login", out var loginProperty)
+            || loginProperty.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        login = loginProperty.GetString() ?? "";
+        return !string.IsNullOrWhiteSpace(login);
     }
 
     private static RepositoryRef ParseRepository(JsonElement repository)
@@ -962,7 +2008,29 @@ internal sealed class GhClient
             args.Add($"after={cursor}");
         }
 
-        var result = await GhCommand.RunAsync(cancellationToken, args.ToArray());
+        return await RunGraphQlAsync(args, cancellationToken);
+    }
+
+    private static async Task<JsonDocument> RunGraphQlQueryAsync(
+        string query,
+        CancellationToken cancellationToken)
+    {
+        var args = new List<string>
+        {
+            "api",
+            "graphql",
+            "-f",
+            $"query={query}",
+        };
+
+        return await RunGraphQlAsync(args, cancellationToken);
+    }
+
+    private static async Task<JsonDocument> RunGraphQlAsync(
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken)
+    {
+        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(90), args.ToArray());
         if (result.ExitCode != 0)
         {
             var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
@@ -976,50 +2044,59 @@ internal sealed class GhClient
 internal sealed class NotificationCleaner
 {
     private readonly HashSet<string> _trackedRepositories;
+    private readonly IReadOnlyList<IgnoredPullRequest> _ignoredPullRequests;
 
-    public NotificationCleaner(IReadOnlyList<RepositoryRef> trackedRepositories)
+    public NotificationCleaner(
+        IReadOnlyList<RepositoryRef> trackedRepositories,
+        IReadOnlyList<IgnoredPullRequest> ignoredPullRequests)
     {
         _trackedRepositories = trackedRepositories
             .Select(repo => repo.FullName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _ignoredPullRequests = ignoredPullRequests;
     }
 
     public async Task<CleanupResult> CleanupAsync(CancellationToken cancellationToken)
     {
-        if (_trackedRepositories.Count == 0)
+        if (_trackedRepositories.Count == 0 && _ignoredPullRequests.Count == 0)
         {
-            return new CleanupResult(0, 0, 0);
+            return new CleanupResult(0, 0, 0, []);
         }
 
-        var notifications = await GetUnreadNotificationsAsync(cancellationToken);
-        notifications = notifications
-            .Where(notification => _trackedRepositories.Contains(notification.RepositoryFullName))
-            .ToArray();
-
+        var notifications = Array.Empty<Notification>();
         var markedRead = 0;
         var skipped = 0;
 
-        await Parallel.ForEachAsync(
-            notifications,
-            new ParallelOptions
-            {
-                CancellationToken = cancellationToken,
-                MaxDegreeOfParallelism = 6,
-            },
-            async (notification, token) =>
-            {
-                var result = await HandleNotificationAsync(notification, token);
-                if (result == CleanupAction.MarkedRead)
-                {
-                    Interlocked.Increment(ref markedRead);
-                }
-                else
-                {
-                    Interlocked.Increment(ref skipped);
-                }
-            });
+        if (_trackedRepositories.Count > 0)
+        {
+            notifications = (await GetUnreadNotificationsAsync(cancellationToken))
+                .Where(notification => _trackedRepositories.Contains(notification.RepositoryFullName))
+                .ToArray();
 
-        return new CleanupResult(notifications.Count, markedRead, skipped);
+            await Parallel.ForEachAsync(
+                notifications,
+                new ParallelOptions
+                {
+                    CancellationToken = cancellationToken,
+                    MaxDegreeOfParallelism = 6,
+                },
+                async (notification, token) =>
+                {
+                    var result = await HandleNotificationAsync(notification, token);
+                    if (result == CleanupAction.MarkedRead)
+                    {
+                        Interlocked.Increment(ref markedRead);
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref skipped);
+                    }
+                });
+        }
+
+        var removedIgnoredPullRequests = await FindClosedIgnoredPullRequestsAsync(cancellationToken);
+
+        return new CleanupResult(notifications.Length, markedRead, skipped, removedIgnoredPullRequests);
     }
 
     private static async Task<IReadOnlyList<Notification>> GetUnreadNotificationsAsync(CancellationToken cancellationToken)
@@ -1119,6 +2196,40 @@ internal sealed class NotificationCleaner
             var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
             throw new InvalidOperationException($"failed to mark notification thread {threadId} as read: {detail.Trim()}");
         }
+    }
+
+    private async Task<IReadOnlyList<IgnoredPullRequest>> FindClosedIgnoredPullRequestsAsync(CancellationToken cancellationToken)
+    {
+        if (_ignoredPullRequests.Count == 0)
+        {
+            return [];
+        }
+
+        var closedPullRequests = new List<IgnoredPullRequest>();
+
+        foreach (var pullRequest in _ignoredPullRequests)
+        {
+            var result = await GhCommand.RunAsync(
+                cancellationToken,
+                TimeSpan.FromSeconds(30),
+                "api",
+                $"repos/{pullRequest.Repository.FullName}/pulls/{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}");
+
+            if (result.ExitCode != 0)
+            {
+                continue;
+            }
+
+            using var doc = JsonDocument.Parse(result.StandardOutput);
+            var state = GetString(doc.RootElement, "state");
+            var merged = GetBool(doc.RootElement, "merged");
+            if (string.Equals(state, "closed", StringComparison.OrdinalIgnoreCase) || merged)
+            {
+                closedPullRequests.Add(pullRequest);
+            }
+        }
+
+        return closedPullRequests;
     }
 
     private static string GetString(JsonElement element, string propertyName)
@@ -1338,13 +2449,23 @@ internal sealed class AppSettings
 {
     private const int DefaultRequiredApprovals = 2;
     private readonly List<RepositoryRef> _repositories;
+    private readonly List<IgnoredPullRequest> _ignoredPullRequests;
 
-    private AppSettings(string settingsPath, int requiredApprovals, IEnumerable<RepositoryRef> repositories)
+    private AppSettings(
+        string settingsPath,
+        int requiredApprovals,
+        IEnumerable<RepositoryRef> repositories,
+        IEnumerable<IgnoredPullRequest> ignoredPullRequests,
+        PrioritySettings priority)
     {
         SettingsPath = settingsPath;
         RequiredApprovals = Math.Max(1, requiredApprovals);
+        Priority = priority;
         _repositories = repositories
             .DistinctBy(repo => repo.FullName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _ignoredPullRequests = ignoredPullRequests
+            .DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
@@ -1352,19 +2473,29 @@ internal sealed class AppSettings
 
     public int RequiredApprovals { get; private set; }
 
+    public PrioritySettings Priority { get; private set; }
+
     public IReadOnlyList<RepositoryRef> Repositories => _repositories;
+
+    public IReadOnlyList<IgnoredPullRequest> IgnoredPullRequests => _ignoredPullRequests;
+
+    public HashSet<string> IgnoredPullRequestKeys => _ignoredPullRequests
+        .Select(pr => pr.Key)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     public static AppSettings Load()
     {
         var settingsPath = GetSettingsPath();
         if (!File.Exists(settingsPath))
         {
-            return new AppSettings(settingsPath, DefaultRequiredApprovals, []);
+            return new AppSettings(settingsPath, DefaultRequiredApprovals, [], [], PrioritySettings.Default);
         }
 
         var repositories = new List<RepositoryRef>();
+        var ignoredPullRequests = new List<IgnoredPullRequest>();
         var requiredApprovals = DefaultRequiredApprovals;
-        var inRepositories = false;
+        var priority = PrioritySettings.Default.ToBuilder();
+        var activeList = SettingsList.None;
 
         foreach (var rawLine in File.ReadLines(settingsPath))
         {
@@ -1377,13 +2508,21 @@ internal sealed class AppSettings
             if (line.Equals("repositories:", StringComparison.OrdinalIgnoreCase)
                 || line.Equals("repos:", StringComparison.OrdinalIgnoreCase))
             {
-                inRepositories = true;
+                activeList = SettingsList.Repositories;
+                continue;
+            }
+
+            if (line.Equals("ignoredPullRequests:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("ignoredPrs:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("ignored:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.IgnoredPullRequests;
                 continue;
             }
 
             if (line.StartsWith("requiredApprovals:", StringComparison.OrdinalIgnoreCase))
             {
-                inRepositories = false;
+                activeList = SettingsList.None;
                 var value = Unquote(line["requiredApprovals:".Length..].Trim());
                 if (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
                 {
@@ -1393,17 +2532,46 @@ internal sealed class AppSettings
                 continue;
             }
 
-            if (inRepositories && line.StartsWith("-", StringComparison.Ordinal))
+            if (line.Equals("priority:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("priorityScoring:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.None;
+                continue;
+            }
+
+            if (line.Equals("ignoredCommentAuthors:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("ignoredCommentAuthorPatterns:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("ignoredAuthors:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.PriorityIgnoredCommentAuthors;
+                continue;
+            }
+
+            if (PrioritySettings.TryApply(priority, line))
+            {
+                activeList = SettingsList.None;
+                continue;
+            }
+
+            if (activeList != SettingsList.None && line.StartsWith("-", StringComparison.Ordinal))
             {
                 var value = Unquote(line[1..].Trim());
-                if (RepositoryRef.TryParse(value, out var repository))
+                if (activeList == SettingsList.Repositories && RepositoryRef.TryParse(value, out var repository))
                 {
                     repositories.Add(repository);
+                }
+                else if (activeList == SettingsList.IgnoredPullRequests && IgnoredPullRequest.TryParse(value, out var ignoredPullRequest))
+                {
+                    ignoredPullRequests.Add(ignoredPullRequest);
+                }
+                else if (activeList == SettingsList.PriorityIgnoredCommentAuthors && value.Length > 0)
+                {
+                    priority.IgnoredCommentAuthorPatterns.Add(value);
                 }
             }
         }
 
-        return new AppSettings(settingsPath, requiredApprovals, repositories);
+        return new AppSettings(settingsPath, requiredApprovals, repositories, ignoredPullRequests, priority.Build());
     }
 
     public SettingsUpdateResult AddRepositories(IReadOnlyList<RepositoryRef> repositories)
@@ -1426,6 +2594,59 @@ internal sealed class AppSettings
         return new SettingsUpdateResult(added, alreadyTracked);
     }
 
+    public bool AddIgnoredPullRequest(IgnoredPullRequest pullRequest)
+    {
+        if (_ignoredPullRequests.Any(existing => string.Equals(existing.Key, pullRequest.Key, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        _ignoredPullRequests.Add(pullRequest);
+        return true;
+    }
+
+    public bool RemoveIgnoredPullRequests(IReadOnlyList<IgnoredPullRequest> pullRequests)
+    {
+        if (pullRequests.Count == 0)
+        {
+            return false;
+        }
+
+        var keysToRemove = pullRequests
+            .Select(pr => pr.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var oldCount = _ignoredPullRequests.Count;
+        _ignoredPullRequests.RemoveAll(pr => keysToRemove.Contains(pr.Key));
+        return _ignoredPullRequests.Count != oldCount;
+    }
+
+    public bool ReplaceIgnoredPullRequests(IReadOnlyList<IgnoredPullRequest> pullRequests)
+    {
+        var current = IgnoredPullRequestKeys;
+        var replacement = pullRequests
+            .Select(pr => pr.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (current.SetEquals(replacement))
+        {
+            return false;
+        }
+
+        _ignoredPullRequests.Clear();
+        _ignoredPullRequests.AddRange(pullRequests.DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase));
+        return true;
+    }
+
+    public bool ReplacePriority(PrioritySettings priority)
+    {
+        if (Priority.SemanticallyEquals(priority))
+        {
+            return false;
+        }
+
+        Priority = priority;
+        return true;
+    }
+
     public void Save()
     {
         var directory = Path.GetDirectoryName(SettingsPath);
@@ -1444,6 +2665,32 @@ internal sealed class AppSettings
             builder.AppendLine($"  - {repo.Url}");
         }
 
+        builder.AppendLine("ignoredPullRequests:");
+        foreach (var pr in _ignoredPullRequests.OrderBy(pr => pr.Repository.FullName, StringComparer.OrdinalIgnoreCase).ThenBy(pr => pr.Number))
+        {
+            builder.AppendLine($"  - {pr.Url}");
+        }
+
+        builder.AppendLine("priority:");
+        builder.AppendLine($"  superHotThreshold: {Priority.SuperHotThreshold.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  hotThreshold: {Priority.HotThreshold.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  noComments: {Priority.NoCommentsPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  oneCommenter: {Priority.OneCommenterPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  twoOrMoreCommenters: {Priority.TwoOrMoreCommentersPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  tenDaysNoReviews: {Priority.TenDaysNoReviewsPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  tenDaysOneReview: {Priority.TenDaysOneReviewPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  reviewRequestedFromUser: {Priority.ReviewRequestedFromUserPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  fiveDaysNoReviews: {Priority.FiveDaysNoReviewsPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  fiveDaysOneReview: {Priority.FiveDaysOneReviewPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  noReviewsNoComments: {Priority.NoReviewsNoCommentsPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  twentyDays: {Priority.TwentyDaysPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  lessThanThreeHoursNoComments: {Priority.LessThanThreeHoursNoCommentsPoints.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine("  ignoredCommentAuthors:");
+        foreach (var pattern in Priority.IgnoredCommentAuthorPatterns)
+        {
+            builder.AppendLine($"    - {pattern}");
+        }
+
         File.WriteAllText(SettingsPath, builder.ToString(), Encoding.UTF8);
     }
 
@@ -1455,8 +2702,30 @@ internal sealed class AppSettings
 
     private static string StripComment(string line)
     {
-        var hashIndex = line.IndexOf('#', StringComparison.Ordinal);
-        return hashIndex >= 0 ? line[..hashIndex] : line;
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (character == '\'' && !inDoubleQuote)
+            {
+                inSingleQuote = !inSingleQuote;
+            }
+            else if (character == '"' && !inSingleQuote)
+            {
+                inDoubleQuote = !inDoubleQuote;
+            }
+            else if (character == '#'
+                && !inSingleQuote
+                && !inDoubleQuote
+                && (index == 0 || char.IsWhiteSpace(line[index - 1])))
+            {
+                return line[..index];
+            }
+        }
+
+        return line;
     }
 
     private static string Unquote(string value)
@@ -1468,6 +2737,314 @@ internal sealed class AppSettings
         }
 
         return value;
+    }
+}
+
+internal enum SettingsList
+{
+    None,
+    Repositories,
+    IgnoredPullRequests,
+    PriorityIgnoredCommentAuthors,
+}
+
+internal sealed record PrioritySettings(
+    int SuperHotThreshold,
+    int HotThreshold,
+    int NoCommentsPoints,
+    int OneCommenterPoints,
+    int TwoOrMoreCommentersPoints,
+    int TenDaysNoReviewsPoints,
+    int TenDaysOneReviewPoints,
+    int ReviewRequestedFromUserPoints,
+    int FiveDaysNoReviewsPoints,
+    int FiveDaysOneReviewPoints,
+    int NoReviewsNoCommentsPoints,
+    int TwentyDaysPoints,
+    int LessThanThreeHoursNoCommentsPoints,
+    IReadOnlyList<string> IgnoredCommentAuthorPatterns)
+{
+    public static PrioritySettings Default { get; } = new(
+        SuperHotThreshold: 40,
+        HotThreshold: 25,
+        NoCommentsPoints: 30,
+        OneCommenterPoints: 15,
+        TwoOrMoreCommentersPoints: -30,
+        TenDaysNoReviewsPoints: 15,
+        TenDaysOneReviewPoints: 10,
+        ReviewRequestedFromUserPoints: 30,
+        FiveDaysNoReviewsPoints: 10,
+        FiveDaysOneReviewPoints: 5,
+        NoReviewsNoCommentsPoints: 10,
+        TwentyDaysPoints: 35,
+        LessThanThreeHoursNoCommentsPoints: -30,
+        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "copilot"]);
+
+    public PrioritySettingsBuilder ToBuilder()
+    {
+        return new PrioritySettingsBuilder
+        {
+            SuperHotThreshold = SuperHotThreshold,
+            HotThreshold = HotThreshold,
+            NoCommentsPoints = NoCommentsPoints,
+            OneCommenterPoints = OneCommenterPoints,
+            TwoOrMoreCommentersPoints = TwoOrMoreCommentersPoints,
+            TenDaysNoReviewsPoints = TenDaysNoReviewsPoints,
+            TenDaysOneReviewPoints = TenDaysOneReviewPoints,
+            ReviewRequestedFromUserPoints = ReviewRequestedFromUserPoints,
+            FiveDaysNoReviewsPoints = FiveDaysNoReviewsPoints,
+            FiveDaysOneReviewPoints = FiveDaysOneReviewPoints,
+            NoReviewsNoCommentsPoints = NoReviewsNoCommentsPoints,
+            TwentyDaysPoints = TwentyDaysPoints,
+            LessThanThreeHoursNoCommentsPoints = LessThanThreeHoursNoCommentsPoints,
+            IgnoredCommentAuthorPatterns = IgnoredCommentAuthorPatterns.ToList(),
+        };
+    }
+
+    public bool SemanticallyEquals(PrioritySettings other)
+    {
+        return SuperHotThreshold == other.SuperHotThreshold
+            && HotThreshold == other.HotThreshold
+            && NoCommentsPoints == other.NoCommentsPoints
+            && OneCommenterPoints == other.OneCommenterPoints
+            && TwoOrMoreCommentersPoints == other.TwoOrMoreCommentersPoints
+            && TenDaysNoReviewsPoints == other.TenDaysNoReviewsPoints
+            && TenDaysOneReviewPoints == other.TenDaysOneReviewPoints
+            && ReviewRequestedFromUserPoints == other.ReviewRequestedFromUserPoints
+            && FiveDaysNoReviewsPoints == other.FiveDaysNoReviewsPoints
+            && FiveDaysOneReviewPoints == other.FiveDaysOneReviewPoints
+            && NoReviewsNoCommentsPoints == other.NoReviewsNoCommentsPoints
+            && TwentyDaysPoints == other.TwentyDaysPoints
+            && LessThanThreeHoursNoCommentsPoints == other.LessThanThreeHoursNoCommentsPoints
+            && IgnoredCommentAuthorPatterns.SequenceEqual(other.IgnoredCommentAuthorPatterns, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static bool TryApply(PrioritySettingsBuilder builder, string line)
+    {
+        var separator = line.IndexOf(':', StringComparison.Ordinal);
+        if (separator <= 0)
+        {
+            return false;
+        }
+
+        var key = NormalizeKey(line[..separator]);
+        var value = Unquote(line[(separator + 1)..].Trim());
+        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var points))
+        {
+            return false;
+        }
+
+        switch (key)
+        {
+            case "superhotthreshold":
+                builder.SuperHotThreshold = points;
+                return true;
+            case "hotthreshold":
+                builder.HotThreshold = points;
+                return true;
+            case "nocomments":
+                builder.NoCommentsPoints = points;
+                return true;
+            case "onecommenter":
+            case "onecommentercomments":
+                builder.OneCommenterPoints = points;
+                return true;
+            case "twoormorecommenters":
+            case "twocommenters":
+                builder.TwoOrMoreCommentersPoints = points;
+                return true;
+            case "tendaysnoreviews":
+                builder.TenDaysNoReviewsPoints = points;
+                return true;
+            case "tendaysonereview":
+            case "tendaysonereviews":
+                builder.TenDaysOneReviewPoints = points;
+                return true;
+            case "reviewrequestedfromuser":
+            case "reviewrequested":
+                builder.ReviewRequestedFromUserPoints = points;
+                return true;
+            case "fivedaysnoreviews":
+                builder.FiveDaysNoReviewsPoints = points;
+                return true;
+            case "fivedaysonereview":
+            case "fivedaysonereviews":
+                builder.FiveDaysOneReviewPoints = points;
+                return true;
+            case "noreviewsnocomments":
+                builder.NoReviewsNoCommentsPoints = points;
+                return true;
+            case "twentydays":
+                builder.TwentyDaysPoints = points;
+                return true;
+            case "lessthanthreehoursnocomments":
+                builder.LessThanThreeHoursNoCommentsPoints = points;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public PullRequestPriority Calculate(
+        DateTimeOffset createdAt,
+        string author,
+        IEnumerable<string> commentAuthors,
+        IEnumerable<string> reviewAuthors,
+        bool reviewRequestedFromUser,
+        DateTimeOffset now)
+    {
+        var humanCommenters = FilterHumanAuthors(commentAuthors, author)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var humanReviewers = FilterHumanAuthors(reviewAuthors, author)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var commentCount = humanCommenters.Count;
+        var reviewCount = humanReviewers.Count;
+        var age = now - createdAt;
+        var score = 0;
+
+        score += commentCount switch
+        {
+            0 => NoCommentsPoints,
+            1 => OneCommenterPoints,
+            _ => TwoOrMoreCommentersPoints,
+        };
+
+        if (age.TotalDays >= 10 && reviewCount == 0)
+        {
+            score += TenDaysNoReviewsPoints;
+        }
+
+        if (age.TotalDays >= 10 && reviewCount == 1)
+        {
+            score += TenDaysOneReviewPoints;
+        }
+
+        if (reviewRequestedFromUser)
+        {
+            score += ReviewRequestedFromUserPoints;
+        }
+
+        if (age.TotalDays >= 5 && reviewCount == 0)
+        {
+            score += FiveDaysNoReviewsPoints;
+        }
+
+        if (age.TotalDays >= 5 && reviewCount == 1)
+        {
+            score += FiveDaysOneReviewPoints;
+        }
+
+        if (reviewCount == 0 && commentCount == 0)
+        {
+            score += NoReviewsNoCommentsPoints;
+        }
+
+        if (age.TotalDays >= 20)
+        {
+            score += TwentyDaysPoints;
+        }
+
+        if (age.TotalHours < 3 && commentCount == 0)
+        {
+            score += LessThanThreeHoursNoCommentsPoints;
+        }
+
+        var heat = score > SuperHotThreshold
+            ? PullRequestHeat.SuperHot
+            : score >= HotThreshold
+                ? PullRequestHeat.Hot
+                : PullRequestHeat.Green;
+
+        return new PullRequestPriority(score, heat, commentCount, reviewCount, reviewRequestedFromUser);
+    }
+
+    private IEnumerable<string> FilterHumanAuthors(IEnumerable<string> authors, string pullRequestAuthor)
+    {
+        return authors
+            .Where(author => !string.IsNullOrWhiteSpace(author))
+            .Select(author => author.Trim())
+            .Where(author => !string.Equals(author, pullRequestAuthor, StringComparison.OrdinalIgnoreCase))
+            .Where(author => !IgnoredCommentAuthorPatterns.Any(pattern =>
+                author.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeKey(string value)
+    {
+        return new string(value.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+    }
+
+    private static string Unquote(string value)
+    {
+        if (value.Length >= 2
+            && ((value[0] == '"' && value[^1] == '"') || (value[0] == '\'' && value[^1] == '\'')))
+        {
+            return value[1..^1];
+        }
+
+        return value;
+    }
+}
+
+internal sealed class PrioritySettingsBuilder
+{
+    public int SuperHotThreshold { get; set; }
+    public int HotThreshold { get; set; }
+    public int NoCommentsPoints { get; set; }
+    public int OneCommenterPoints { get; set; }
+    public int TwoOrMoreCommentersPoints { get; set; }
+    public int TenDaysNoReviewsPoints { get; set; }
+    public int TenDaysOneReviewPoints { get; set; }
+    public int ReviewRequestedFromUserPoints { get; set; }
+    public int FiveDaysNoReviewsPoints { get; set; }
+    public int FiveDaysOneReviewPoints { get; set; }
+    public int NoReviewsNoCommentsPoints { get; set; }
+    public int TwentyDaysPoints { get; set; }
+    public int LessThanThreeHoursNoCommentsPoints { get; set; }
+    public List<string> IgnoredCommentAuthorPatterns { get; set; } = [];
+
+    public PrioritySettings Build()
+    {
+        return new PrioritySettings(
+            SuperHotThreshold,
+            HotThreshold,
+            NoCommentsPoints,
+            OneCommenterPoints,
+            TwoOrMoreCommentersPoints,
+            TenDaysNoReviewsPoints,
+            TenDaysOneReviewPoints,
+            ReviewRequestedFromUserPoints,
+            FiveDaysNoReviewsPoints,
+            FiveDaysOneReviewPoints,
+            NoReviewsNoCommentsPoints,
+            TwentyDaysPoints,
+            LessThanThreeHoursNoCommentsPoints,
+            IgnoredCommentAuthorPatterns
+                .Where(pattern => !string.IsNullOrWhiteSpace(pattern))
+                .Select(pattern => pattern.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
+    }
+}
+
+internal static class LegacyProtocolHandler
+{
+    private const string Scheme = "pr-ignore";
+
+    public static void TryUnregister()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        try
+        {
+            Registry.CurrentUser.DeleteSubKeyTree($@"Software\Classes\{Scheme}", throwOnMissingSubKey: false);
+        }
+        catch
+        {
+        }
     }
 }
 
@@ -1647,6 +3224,30 @@ internal sealed record PullRequestTarget(RepositoryRef? Repository, int Number)
     }
 }
 
+internal sealed record IgnoredPullRequest(RepositoryRef Repository, int Number)
+{
+    public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
+
+    public string Url => Repository.GetPullRequestUrl(Number);
+
+    public static IgnoredPullRequest From(PullRequestInfo pullRequest)
+    {
+        return new IgnoredPullRequest(pullRequest.Repository, pullRequest.Number);
+    }
+
+    public static bool TryParse(string value, out IgnoredPullRequest pullRequest)
+    {
+        pullRequest = default!;
+        if (!PullRequestTarget.TryParse(value, out var target) || target.Repository is null)
+        {
+            return false;
+        }
+
+        pullRequest = new IgnoredPullRequest(target.Repository, target.Number);
+        return true;
+    }
+}
+
 internal sealed record RepositoryRef(string Owner, string Name)
 {
     public string FullName => $"{Owner}/{Name}";
@@ -1744,25 +3345,58 @@ internal sealed record FetchResult(
     int OpenNonDraftCount,
     int ApiCalls,
     int TrackedRepositoryCount,
-    string? ExcludedAuthor);
+    string? ExcludedAuthor,
+    bool IsPartial);
 
 internal sealed record PullRequestInfo(
+    string NodeId,
     RepositoryRef Repository,
     int Number,
     string Title,
     string Author,
     string Url,
     DateTimeOffset CreatedAt,
-    IReadOnlyList<string> Approvers)
+    IReadOnlyList<string> Approvers,
+    PullRequestPriority Priority)
 {
     public int ApprovalCount => Approvers.Count;
 
     public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
 }
 
+internal sealed record PriorityDetail(
+    string NodeId,
+    PullRequestPriority Priority);
+
+internal sealed record PullRequestPriority(
+    int Score,
+    PullRequestHeat Heat,
+    int HumanCommenterCount,
+    int HumanReviewCount,
+    bool ReviewRequestedFromUser)
+{
+    public string Label => Heat switch
+    {
+        PullRequestHeat.SuperHot => $"{Score.ToString(CultureInfo.InvariantCulture)} super",
+        PullRequestHeat.Hot => $"{Score.ToString(CultureInfo.InvariantCulture)} hot",
+        _ => $"{Score.ToString(CultureInfo.InvariantCulture)} green",
+    };
+}
+
+internal enum PullRequestHeat
+{
+    Green,
+    Hot,
+    SuperHot,
+}
+
 internal sealed record Notification(string Id, string SubjectUrl, string SubjectType, string RepositoryFullName);
 
-internal sealed record CleanupResult(int Scanned, int MarkedRead, int Skipped);
+internal sealed record CleanupResult(
+    int Scanned,
+    int MarkedRead,
+    int Skipped,
+    IReadOnlyList<IgnoredPullRequest> RemovedIgnoredPullRequests);
 
 internal enum CleanupAction
 {
