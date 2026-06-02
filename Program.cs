@@ -221,8 +221,10 @@ static async Task PrintOnceAsync(AppSettings settings, CancellationToken cancell
 
 internal sealed class DashboardApp
 {
-    private static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan FailedRefreshRetryInterval = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromHours(1);
+    private static readonly TimeSpan FailedCleanupRetryInterval = TimeSpan.FromMinutes(15);
     private static readonly IReadOnlySet<string> NoIgnoredPullRequestKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private const int RepoColumn = 0;
     private const int PullRequestColumn = 1;
@@ -238,6 +240,7 @@ internal sealed class DashboardApp
     private readonly string _settingsPath;
     private readonly GhClient _client = new();
     private IReadOnlyList<PullRequestInfo> _items = [];
+    private Dictionary<string, PullRequestPriority> _lastSuccessfulPriorities = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _ignoredPullRequestKeys;
     private HashSet<string>? _knownPullRequestKeys;
     private bool _showIgnoredPullRequests;
@@ -255,6 +258,7 @@ internal sealed class DashboardApp
     private int _lastCleanupRemovedIgnored;
     private int _ignoredPullRequestCount;
     private DateTime _settingsLastWriteUtc;
+    private CancellationTokenSource? _appCancellation;
 
     public DashboardApp(AppSettings settings)
     {
@@ -272,6 +276,7 @@ internal sealed class DashboardApp
     {
         Tui.Application.Init();
         using var appCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _appCancellation = appCancellation;
         var dashboard = new DashboardView(this);
 
         try
@@ -296,6 +301,7 @@ internal sealed class DashboardApp
         }
         finally
         {
+            _appCancellation = null;
             Tui.Application.Shutdown();
         }
     }
@@ -305,6 +311,7 @@ internal sealed class DashboardApp
         Task<FetchResult>? refresh = null;
         Task<FetchResult>? priorityRefresh = null;
         Task<CleanupResult>? cleanup = null;
+        var refreshIsFirstPageOnly = false;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -320,7 +327,8 @@ internal sealed class DashboardApp
                     _settings.Priority,
                     cancellationToken,
                     includePriorityDetails: false,
-                    maxPages: firstPaintOnly ? 1 : null);
+                    maxPages: firstPaintOnly ? 1 : GhClient.MaxSearchPages);
+                refreshIsFirstPageOnly = firstPaintOnly;
                 _error = null;
                 startedWork = true;
             }
@@ -341,8 +349,9 @@ internal sealed class DashboardApp
                 try
                 {
                     var result = await refresh;
-                    ApplyFetchResult(result, dingOnNewItems: !result.IsPartial);
-                    if (result.IsPartial)
+                    var wasFirstPageOnly = refreshIsFirstPageOnly;
+                    ApplyFetchResult(result, dingOnNewItems: !result.IsPartial, preserveExistingPriorities: true);
+                    if (result.IsPartial && wasFirstPageOnly)
                     {
                         refresh = _client.FetchPullRequestsAsync(
                             _repositories,
@@ -350,7 +359,9 @@ internal sealed class DashboardApp
                             NoIgnoredPullRequestKeys,
                             _settings.Priority,
                             cancellationToken,
-                            includePriorityDetails: false);
+                            includePriorityDetails: false,
+                            maxPages: GhClient.MaxSearchPages);
+                        refreshIsFirstPageOnly = false;
                     }
                     else
                     {
@@ -359,13 +370,15 @@ internal sealed class DashboardApp
                             _settings.Priority,
                             cancellationToken);
                         refresh = null;
+                        refreshIsFirstPageOnly = false;
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _error = ex.Message;
-                    _nextRefresh = DateTimeOffset.UtcNow.AddSeconds(30);
+                    _nextRefresh = DateTimeOffset.UtcNow.Add(FailedRefreshRetryInterval);
                     refresh = null;
+                    refreshIsFirstPageOnly = false;
                 }
 
                 RefreshOnUi(dashboard, isRefreshing: refresh is not null || priorityRefresh is not null, cleanup is not null);
@@ -375,11 +388,12 @@ internal sealed class DashboardApp
             {
                 try
                 {
-                    ApplyFetchResult(await priorityRefresh, dingOnNewItems: false);
+                    ApplyFetchResult(await priorityRefresh, dingOnNewItems: false, updateSuccessfulPriorities: true);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _error = $"priority refresh failed: {ex.Message}";
+                    _nextRefresh = DateTimeOffset.UtcNow.Add(FailedRefreshRetryInterval);
                 }
 
                 priorityRefresh = null;
@@ -395,7 +409,7 @@ internal sealed class DashboardApp
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _cleanupError = ex.Message;
-                    _nextCleanup = DateTimeOffset.UtcNow.AddMinutes(5);
+                    _nextCleanup = DateTimeOffset.UtcNow.Add(FailedCleanupRetryInterval);
                 }
 
                 cleanup = null;
@@ -415,11 +429,24 @@ internal sealed class DashboardApp
     {
         try
         {
-            Tui.Application.MainLoop.Invoke(() => Tui.Application.RequestStop(Tui.Application.Top));
+            Tui.Application.RequestStop();
         }
         catch
         {
         }
+    }
+
+    private void Quit()
+    {
+        try
+        {
+            _appCancellation?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        RequestStop();
     }
 
     private static void RefreshOnUi(DashboardView dashboard, bool isRefreshing, bool isCleaning)
@@ -433,20 +460,47 @@ internal sealed class DashboardApp
         }
     }
 
-    private void ApplyFetchResult(FetchResult result, bool dingOnNewItems = true)
+    private void ApplyFetchResult(
+        FetchResult result,
+        bool dingOnNewItems = true,
+        bool preserveExistingPriorities = false,
+        bool updateSuccessfulPriorities = false)
     {
+        var items = preserveExistingPriorities
+            ? PreserveExistingPriorities(result.Items)
+            : result.Items;
+
         if (dingOnNewItems)
         {
-            DingOnNewItems(result.Items);
+            DingOnNewItems(items);
         }
 
-        _items = result.Items;
+        _items = items;
         _lastRefresh = DateTimeOffset.UtcNow;
         _nextRefresh = _lastRefresh.Value.Add(RefreshInterval);
         _apiCalls = result.ApiCalls;
         _openNonDraftCount = result.OpenNonDraftCount;
         _currentUserLogin = result.ExcludedAuthor;
         _error = null;
+
+        if (updateSuccessfulPriorities)
+        {
+            _lastSuccessfulPriorities = items.ToDictionary(item => item.Key, item => item.Priority, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private IReadOnlyList<PullRequestInfo> PreserveExistingPriorities(IReadOnlyList<PullRequestInfo> items)
+    {
+        if (_lastSuccessfulPriorities.Count == 0 || items.Count == 0)
+        {
+            return items;
+        }
+
+        return items
+            .Select(item => _lastSuccessfulPriorities.TryGetValue(item.Key, out var priority)
+                ? item with { Priority = priority }
+                : item)
+            .ToArray();
     }
 
     private void ApplyCleanupResult(CleanupResult result)
@@ -826,7 +880,7 @@ internal sealed class DashboardApp
                 ColorScheme = GrayScheme,
                 CellClicked = ActivateCell,
             };
-            _table.CellActivated += args => ActivateCell(args.Col == IgnoreColumn ? IgnoreColumn : TitleColumn, args.Row);
+            _table.CellActivated += args => ActivateCell(args.Col, args.Row);
             _table.KeyPress += HandleKeyPress;
 
             _loadingFrame = new Tui.View
@@ -1189,7 +1243,12 @@ internal sealed class DashboardApp
                 return IgnoredScheme;
             }
 
-            return _visiblePullRequests[args.RowIndex].Priority.Heat switch
+            return HeatColor(_visiblePullRequests[args.RowIndex].Priority.Heat);
+        }
+
+        private static Tui.ColorScheme HeatColor(PullRequestHeat heat)
+        {
+            return heat switch
             {
                 PullRequestHeat.SuperHot => RedScheme,
                 PullRequestHeat.Hot => YellowScheme,
@@ -1254,8 +1313,8 @@ internal sealed class DashboardApp
         private string ScanText()
         {
             var scanText = _owner._currentUserLogin is null
-                ? $"{_owner._openNonDraftCount} open non-draft PRs scanned, {_owner._apiCalls} request page(s)"
-                : $"{_owner._openNonDraftCount} open non-draft PRs scanned, excluding @{_owner._currentUserLogin}, {_owner._apiCalls} request page(s)";
+                ? $"{_owner._openNonDraftCount} open non-draft PRs matched, {_owner._apiCalls} request page(s)"
+                : $"{_owner._openNonDraftCount} open non-draft PRs matched, excluding @{_owner._currentUserLogin}, {_owner._apiCalls} request page(s)";
             if (_owner._ignoredPullRequestCount > 0)
             {
                 scanText += $", {_owner._ignoredPullRequestCount} ignored";
@@ -1324,7 +1383,7 @@ internal sealed class DashboardApp
 
             if (key == Tui.Key.Q || key == Tui.Key.q || key == Tui.Key.Esc)
             {
-                RequestStop();
+                _owner.Quit();
                 args.Handled = true;
                 return;
             }
@@ -1398,6 +1457,10 @@ internal sealed class DashboardApp
             var pullRequest = _visiblePullRequests[row];
             switch (column)
             {
+                case PullRequestColumn:
+                    ShowPriorityDialog(pullRequest);
+                    break;
+
                 case TitleColumn:
                     PullRequests.OpenUrl(pullRequest.Url);
                     break;
@@ -1410,6 +1473,132 @@ internal sealed class DashboardApp
 
                     break;
             }
+        }
+
+        private void ShowPriorityDialog(PullRequestInfo pullRequest)
+        {
+            var priority = pullRequest.Priority;
+            var width = Math.Clamp(Tui.Application.Driver.Cols - 4, 72, 104);
+            var height = Math.Clamp(Tui.Application.Driver.Rows - 4, 18, 26);
+            var close = new Tui.Button("Close", true);
+            var dialog = new Tui.Dialog($"Hotness #{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}", width, height, close)
+            {
+                ColorScheme = GrayScheme,
+            };
+            close.Clicked += () => Tui.Application.RequestStop(dialog);
+
+            var summary = new Tui.Label
+            {
+                X = 1,
+                Y = 1,
+                Width = Tui.Dim.Fill(2),
+                Height = 3,
+                Text = $"{pullRequest.Repository.Name}  #{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}  {Truncate(pullRequest.Title, Math.Max(20, width - 28))}\n"
+                    + $"Score {priority.Score.ToString(CultureInfo.InvariantCulture)} ({priority.Label}); hot >= {_owner._settings.Priority.HotThreshold.ToString(CultureInfo.InvariantCulture)}, super > {_owner._settings.Priority.SuperHotThreshold.ToString(CultureInfo.InvariantCulture)}\n"
+                    + $"Human commenters: {priority.HumanCommenterCount.ToString(CultureInfo.InvariantCulture)}; human reviewers: {priority.HumanReviewCount.ToString(CultureInfo.InvariantCulture)}; requested from you: {(priority.ReviewRequestedFromUser ? "yes" : "no")}",
+            };
+
+            var table = new Tui.TableView
+            {
+                X = 1,
+                Y = 5,
+                Width = Tui.Dim.Fill(2),
+                Height = Tui.Dim.Fill(2),
+                FullRowSelect = true,
+                CanFocus = true,
+                ColorScheme = GrayScheme,
+            };
+            var data = BuildPriorityTable(priority);
+            table.Table = data;
+            table.Style = BuildPriorityTableStyle(data, priority);
+
+            dialog.Add(summary);
+            dialog.Add(table);
+            table.SetFocus();
+            Tui.Application.Run(dialog);
+            _table.SetFocus();
+        }
+
+        private static DataTable BuildPriorityTable(PullRequestPriority priority)
+        {
+            var table = new DataTable();
+            table.Columns.Add("Rule");
+            table.Columns.Add("Points");
+            table.Columns.Add("State");
+
+            foreach (var rule in priority.Rules)
+            {
+                table.Rows.Add(
+                    rule.Label,
+                    FormatPoints(rule.Points),
+                    rule.Applied ? "applied" : "not applied");
+            }
+
+            table.Rows.Add("Sum", FormatPoints(priority.Score), priority.Label);
+            return table;
+        }
+
+        private Tui.TableView.TableStyle BuildPriorityTableStyle(DataTable table, PullRequestPriority priority)
+        {
+            var style = new Tui.TableView.TableStyle
+            {
+                AlwaysShowHeaders = true,
+                ShowHorizontalHeaderUnderline = true,
+                ShowVerticalCellLines = true,
+                ShowHorizontalScrollIndicators = false,
+                ExpandLastColumn = false,
+                RowColorGetter = args => PriorityRuleColor(args.RowIndex, priority),
+            };
+
+            style.ColumnStyles[table.Columns[0]!] = new Tui.TableView.ColumnStyle
+            {
+                MinWidth = 34,
+                MaxWidth = Math.Max(34, Math.Min(58, Tui.Application.Driver.Cols - 30)),
+                MinAcceptableWidth = 24,
+            };
+            style.ColumnStyles[table.Columns[1]!] = new Tui.TableView.ColumnStyle
+            {
+                MinWidth = 8,
+                MaxWidth = 8,
+                MinAcceptableWidth = 8,
+                Alignment = Tui.TextAlignment.Right,
+            };
+            style.ColumnStyles[table.Columns[2]!] = new Tui.TableView.ColumnStyle
+            {
+                MinWidth = 14,
+                MaxWidth = 18,
+                MinAcceptableWidth = 12,
+            };
+
+            return style;
+        }
+
+        private Tui.ColorScheme PriorityRuleColor(int rowIndex, PullRequestPriority priority)
+        {
+            if (rowIndex < 0)
+            {
+                return GrayScheme;
+            }
+
+            if (rowIndex >= priority.Rules.Count)
+            {
+                return HeatColor(priority.Heat);
+            }
+
+            var rule = priority.Rules[rowIndex];
+            if (!rule.Applied || rule.Points == 0)
+            {
+                return GrayScheme;
+            }
+
+            return rule.Points < 0 ? GreenScheme : RedScheme;
+        }
+
+        private static string FormatPoints(int points)
+        {
+            return points > 0
+                ? "+" + points.ToString(CultureInfo.InvariantCulture)
+                : points.ToString(CultureInfo.InvariantCulture);
         }
 
         private void ToggleSelected()
@@ -1482,13 +1671,17 @@ internal sealed class DashboardApp
 
 internal sealed class GhClient
 {
+    private const int SearchPageSize = 100;
+    public const int MaxSearchResults = 1_000;
+    public const int MaxSearchPages = MaxSearchResults / SearchPageSize;
     private const int MaxSearchQueryLength = 1_800;
+    private static readonly TimeSpan GhApiTimeout = TimeSpan.FromMinutes(3);
     private string? _currentUserLogin;
     private bool _currentUserLoginResolved;
 
-    private const string GraphQlQuery = """
+    private static readonly string GraphQlQuery = $$"""
         query($searchText: String!, $after: String) {
-          search(query: $searchText, type: ISSUE, first: 100, after: $after) {
+          search(query: $searchText, type: ISSUE, first: {{SearchPageSize}}, after: $after) {
             issueCount
             pageInfo {
               hasNextPage
@@ -1649,6 +1842,7 @@ internal sealed class GhClient
                 pullRequest.Author,
                 pullRequest.CreatedAt,
                 reviewRequestedFromUser,
+                currentUserLogin,
                 priority,
                 now);
             details.Add(new PriorityDetail(nodeId, updatedPriority));
@@ -1852,7 +2046,7 @@ internal sealed class GhClient
             .ToArray();
         var reviewRequestedFromUser = !string.IsNullOrWhiteSpace(currentUserLogin)
             && ReviewRequestedUsers(node).Contains(currentUserLogin, StringComparer.OrdinalIgnoreCase);
-        var priority = CalculatePriority(node, author, createdAt, reviewRequestedFromUser, prioritySettings, now);
+        var priority = CalculatePriority(node, author, createdAt, reviewRequestedFromUser, currentUserLogin, prioritySettings, now);
 
         return new PullRequestInfo(
             node.GetProperty("id").GetString() ?? "",
@@ -1871,12 +2065,14 @@ internal sealed class GhClient
         string author,
         DateTimeOffset createdAt,
         bool reviewRequestedFromUser,
+        string? currentUserLogin,
         PrioritySettings prioritySettings,
         DateTimeOffset now)
     {
         return prioritySettings.Calculate(
             createdAt,
             author,
+            currentUserLogin,
             CommentAuthors(node),
             ReviewAuthors(node),
             reviewRequestedFromUser,
@@ -2030,7 +2226,7 @@ internal sealed class GhClient
         IReadOnlyList<string> args,
         CancellationToken cancellationToken)
     {
-        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(90), args.ToArray());
+        var result = await GhCommand.RunAsync(cancellationToken, GhApiTimeout, args.ToArray());
         if (result.ExitCode != 0)
         {
             var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
@@ -2102,7 +2298,7 @@ internal sealed class NotificationCleaner
     private static async Task<IReadOnlyList<Notification>> GetUnreadNotificationsAsync(CancellationToken cancellationToken)
     {
         const string jqFilter = ".[] | select(.unread == true) | [.id, .subject.url, .subject.type, .repository.full_name] | @tsv";
-        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(90), "api", "/notifications", "--paginate", "--jq", jqFilter);
+        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromMinutes(3), "api", "/notifications", "--paginate", "--jq", jqFilter);
 
         if (result.ExitCode != 0)
         {
@@ -2888,66 +3084,38 @@ internal sealed record PrioritySettings(
     public PullRequestPriority Calculate(
         DateTimeOffset createdAt,
         string author,
+        string? currentUserLogin,
         IEnumerable<string> commentAuthors,
         IEnumerable<string> reviewAuthors,
         bool reviewRequestedFromUser,
         DateTimeOffset now)
     {
-        var humanCommenters = FilterHumanAuthors(commentAuthors, author)
+        var humanCommenters = FilterHumanAuthors(commentAuthors, author, currentUserLogin)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var humanReviewers = FilterHumanAuthors(reviewAuthors, author)
+        var humanReviewers = FilterHumanAuthors(reviewAuthors, author, currentUserLogin)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var commentCount = humanCommenters.Count;
         var reviewCount = humanReviewers.Count;
         var age = now - createdAt;
         var score = 0;
-
-        score += commentCount switch
+        var rules = new List<PriorityRuleScore>
         {
-            0 => NoCommentsPoints,
-            1 => OneCommenterPoints,
-            _ => TwoOrMoreCommentersPoints,
+            new("No human comments", NoCommentsPoints, commentCount == 0),
+            new("One human commenter", OneCommenterPoints, commentCount == 1),
+            new("Two or more human commenters", TwoOrMoreCommentersPoints, commentCount >= 2),
+            new("10+ days old and no reviews", TenDaysNoReviewsPoints, age.TotalDays >= 10 && reviewCount == 0),
+            new("10+ days old and one reviewer", TenDaysOneReviewPoints, age.TotalDays >= 10 && reviewCount == 1),
+            new("Review requested from you", ReviewRequestedFromUserPoints, reviewRequestedFromUser),
+            new("5+ days old and no reviews", FiveDaysNoReviewsPoints, age.TotalDays >= 5 && reviewCount == 0),
+            new("5+ days old and one reviewer", FiveDaysOneReviewPoints, age.TotalDays >= 5 && reviewCount == 1),
+            new("No reviews and no human comments", NoReviewsNoCommentsPoints, reviewCount == 0 && commentCount == 0),
+            new("20+ days old", TwentyDaysPoints, age.TotalDays >= 20),
+            new("Less than 3 hours old and no comments", LessThanThreeHoursNoCommentsPoints, age.TotalHours < 3 && commentCount == 0),
         };
 
-        if (age.TotalDays >= 10 && reviewCount == 0)
-        {
-            score += TenDaysNoReviewsPoints;
-        }
-
-        if (age.TotalDays >= 10 && reviewCount == 1)
-        {
-            score += TenDaysOneReviewPoints;
-        }
-
-        if (reviewRequestedFromUser)
-        {
-            score += ReviewRequestedFromUserPoints;
-        }
-
-        if (age.TotalDays >= 5 && reviewCount == 0)
-        {
-            score += FiveDaysNoReviewsPoints;
-        }
-
-        if (age.TotalDays >= 5 && reviewCount == 1)
-        {
-            score += FiveDaysOneReviewPoints;
-        }
-
-        if (reviewCount == 0 && commentCount == 0)
-        {
-            score += NoReviewsNoCommentsPoints;
-        }
-
-        if (age.TotalDays >= 20)
-        {
-            score += TwentyDaysPoints;
-        }
-
-        if (age.TotalHours < 3 && commentCount == 0)
-        {
-            score += LessThanThreeHoursNoCommentsPoints;
-        }
+        score = rules
+            .Where(rule => rule.Applied)
+            .Sum(rule => rule.Points);
 
         var heat = score > SuperHotThreshold
             ? PullRequestHeat.SuperHot
@@ -2955,15 +3123,17 @@ internal sealed record PrioritySettings(
                 ? PullRequestHeat.Hot
                 : PullRequestHeat.Green;
 
-        return new PullRequestPriority(score, heat, commentCount, reviewCount, reviewRequestedFromUser);
+        return new PullRequestPriority(score, heat, commentCount, reviewCount, reviewRequestedFromUser, rules);
     }
 
-    private IEnumerable<string> FilterHumanAuthors(IEnumerable<string> authors, string pullRequestAuthor)
+    private IEnumerable<string> FilterHumanAuthors(IEnumerable<string> authors, string pullRequestAuthor, string? currentUserLogin)
     {
         return authors
             .Where(author => !string.IsNullOrWhiteSpace(author))
             .Select(author => author.Trim())
             .Where(author => !string.Equals(author, pullRequestAuthor, StringComparison.OrdinalIgnoreCase))
+            .Where(author => string.IsNullOrWhiteSpace(currentUserLogin)
+                || !string.Equals(author, currentUserLogin, StringComparison.OrdinalIgnoreCase))
             .Where(author => !IgnoredCommentAuthorPatterns.Any(pattern =>
                 author.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
             .Distinct(StringComparer.OrdinalIgnoreCase);
@@ -3373,7 +3543,8 @@ internal sealed record PullRequestPriority(
     PullRequestHeat Heat,
     int HumanCommenterCount,
     int HumanReviewCount,
-    bool ReviewRequestedFromUser)
+    bool ReviewRequestedFromUser,
+    IReadOnlyList<PriorityRuleScore> Rules)
 {
     public string Label => Heat switch
     {
@@ -3382,6 +3553,11 @@ internal sealed record PullRequestPriority(
         _ => $"{Score.ToString(CultureInfo.InvariantCulture)} green",
     };
 }
+
+internal sealed record PriorityRuleScore(
+    string Label,
+    int Points,
+    bool Applied);
 
 internal enum PullRequestHeat
 {

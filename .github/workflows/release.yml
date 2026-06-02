@@ -1,0 +1,112 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+      - "release/*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore ./Pr.slnx
+      - run: dotnet build ./Pr.slnx -c Release --no-restore
+
+  build:
+    name: build ${{ matrix.asset }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            asset: pr-linux-x64
+            binary: pr
+          - os: ubuntu-latest
+            rid: linux-arm64
+            asset: pr-linux-arm64
+            binary: pr
+          - os: windows-latest
+            rid: win-x64
+            asset: pr-windows-x64.exe
+            binary: pr.exe
+          - os: windows-latest
+            rid: win-arm64
+            asset: pr-windows-arm64.exe
+            binary: pr.exe
+          - os: macos-latest
+            rid: osx-x64
+            asset: pr-macos-x64
+            binary: pr
+          - os: macos-latest
+            rid: osx-arm64
+            asset: pr-macos-arm64
+            binary: pr
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Publish single-file executable
+        shell: pwsh
+        run: >
+          dotnet publish ./Pr.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -p:DebugSymbols=false
+          -o publish/${{ matrix.rid }}
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "publish/${{ matrix.rid }}/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          if ($env:RUNNER_OS -ne 'Windows') {
+            chmod +x "dist/${{ matrix.asset }}"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: List release assets
+        run: ls -lh release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
