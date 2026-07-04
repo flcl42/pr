@@ -11,19 +11,19 @@ still shells out to `gh`, so install and authenticate GitHub CLI first with
 Linux, bash:
 
 ```bash
-repo=flcl42/pr; dir="$HOME/.local/bin"; arch="$(uname -m)"; asset=pr-linux-x64; case "$arch" in aarch64|arm64) asset=pr-linux-arm64;; esac; mkdir -p "$dir"; curl -fsSL "https://github.com/$repo/releases/latest/download/$asset" -o "$dir/pr"; chmod +x "$dir/pr"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+repo=flcl42/pr; arch="$(uname -m)"; asset=pr-linux-x64; case "$arch" in aarch64|arm64) asset=pr-linux-arm64;; esac; curl -fsSL "https://github.com/$repo/releases/latest/download/$asset" -o ./pr; chmod +x ./pr
 ```
 
 macOS, zsh:
 
 ```zsh
-repo=flcl42/pr; dir="$HOME/.local/bin"; arch="$(uname -m)"; asset=pr-macos-arm64; [ "$arch" = "x86_64" ] && asset=pr-macos-x64; mkdir -p "$dir"; curl -fsSL "https://github.com/$repo/releases/latest/download/$asset" -o "$dir/pr"; chmod +x "$dir/pr"; grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+repo=flcl42/pr; arch="$(uname -m)"; asset=pr-macos-arm64; [ "$arch" = "x86_64" ] && asset=pr-macos-x64; curl -fsSL "https://github.com/$repo/releases/latest/download/$asset" -o ./pr; chmod +x ./pr
 ```
 
 Windows, PowerShell:
 
 ```powershell
-$repo='flcl42/pr'; $dir='C:\Programs'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/pr-windows-x64.exe" -OutFile "$dir\pr.exe"; $p=[Environment]::GetEnvironmentVariable('Path','User'); if (($p -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ((@($p -split ';') + $dir | Where-Object { $_ }) -join ';'), 'User'); $env:Path += ";$dir" }
+$repo='flcl42/pr'; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/pr-windows-x64.exe" -OutFile ".\pr.exe"
 ```
 
 ## Usage
