@@ -64,6 +64,8 @@ try
         return;
     }
 
+    using var singleInstance = SingleInstanceLease.Acquire();
+
     if (commandLine.PrintOnce)
     {
         await PrintOnceAsync(settings, shutdown.Token);
@@ -72,19 +74,30 @@ try
 
     if (commandLine.CleanupOnce)
     {
-        if (settings.Repositories.Count == 0 && settings.IgnoredPullRequests.Count == 0)
+        if (settings.Repositories.Count == 0
+            && settings.IgnoredPullRequests.Count == 0
+            && settings.TopPullRequests.Count == 0)
         {
             Console.WriteLine("No tracked repositories. Add one with: pr https://github.com/OWNER/REPO");
             return;
         }
 
-        var result = await new NotificationCleaner(settings.Repositories, settings.IgnoredPullRequests).CleanupAsync(shutdown.Token);
-        if (settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests))
+        var result = await new NotificationCleaner(
+            settings.Repositories,
+            settings.IgnoredPullRequests,
+            settings.TopPullRequests).CleanupAsync(shutdown.Token);
+        var ignoredChanged = settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests);
+        var topChanged = settings.RemoveTopPullRequests(result.RemovedTopPullRequests);
+        if (ignoredChanged || topChanged)
         {
             settings.Save();
         }
 
-        Console.WriteLine($"Scanned {result.Scanned} unread notification(s) from tracked repos; marked {result.MarkedRead} as read; removed {result.RemovedIgnoredPullRequests.Count} closed ignored PR(s).");
+        Console.WriteLine(
+            $"Scanned {result.Scanned} unread notification(s) from tracked repos; "
+            + $"marked {result.MarkedRead} as read; "
+            + $"removed {result.RemovedIgnoredPullRequests.Count} closed ignored PR(s) and "
+            + $"{result.RemovedTopPullRequests.Count} closed top PR(s).");
         return;
     }
 
@@ -92,6 +105,11 @@ try
 }
 catch (OperationCanceledException)
 {
+}
+catch (SingleInstanceException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    Environment.ExitCode = 1;
 }
 
 static void PrintUsage()
@@ -239,9 +257,13 @@ internal sealed class DashboardApp
     private readonly int _requiredApprovals;
     private readonly string _settingsPath;
     private readonly GhClient _client = new();
+    private readonly CodexReviewWatcher _codexReviewWatcher;
     private IReadOnlyList<PullRequestInfo> _items = [];
+    private IReadOnlyDictionary<string, PullRequestInfo> _recentlyAcknowledgedCodexPullRequests
+        = new Dictionary<string, PullRequestInfo>(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, PullRequestPriority> _lastSuccessfulPriorities = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _ignoredPullRequestKeys;
+    private HashSet<string> _topPullRequestKeys;
     private HashSet<string>? _knownPullRequestKeys;
     private bool _showIgnoredPullRequests;
     private DateTimeOffset? _lastRefresh;
@@ -259,6 +281,8 @@ internal sealed class DashboardApp
     private int _ignoredPullRequestCount;
     private DateTime _settingsLastWriteUtc;
     private CancellationTokenSource? _appCancellation;
+    private DashboardView? _dashboard;
+    private CodexReviewSnapshot _codexReviewSnapshot = CodexReviewSnapshot.Disabled;
 
     public DashboardApp(AppSettings settings)
     {
@@ -267,9 +291,17 @@ internal sealed class DashboardApp
         _requiredApprovals = settings.RequiredApprovals;
         _settingsPath = settings.SettingsPath;
         _ignoredPullRequestKeys = settings.IgnoredPullRequestKeys;
+        _topPullRequestKeys = settings.TopPullRequestKeys;
         _ignoredPullRequestCount = settings.IgnoredPullRequests.Count;
         _settingsLastWriteUtc = GetSettingsLastWriteUtc();
         _nextCleanup = DateTimeOffset.UtcNow.AddSeconds(20);
+        _codexReviewWatcher = new CodexReviewWatcher(
+            _repositories,
+            _settingsPath,
+            () => _settings.CodexReview,
+            () => _ignoredPullRequestKeys,
+            ApplyCodexReviewSnapshot);
+        _codexReviewSnapshot = _codexReviewWatcher.Snapshot;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -278,6 +310,7 @@ internal sealed class DashboardApp
         using var appCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _appCancellation = appCancellation;
         var dashboard = new DashboardView(this);
+        _dashboard = dashboard;
 
         try
         {
@@ -286,6 +319,7 @@ internal sealed class DashboardApp
             dashboard.Refresh(isRefreshing: _repositories.Count > 0, isCleaning: false);
 
             var worker = RunBackgroundLoopAsync(dashboard, appCancellation.Token);
+            var codexReviewWorker = _codexReviewWatcher.RunAsync(appCancellation.Token);
             using var cancelRegistration = cancellationToken.Register(RequestStop);
 
             Tui.Application.Run();
@@ -293,7 +327,7 @@ internal sealed class DashboardApp
 
             try
             {
-                await worker;
+                await Task.WhenAll(worker, codexReviewWorker);
             }
             catch (OperationCanceledException) when (appCancellation.IsCancellationRequested)
             {
@@ -302,6 +336,7 @@ internal sealed class DashboardApp
         finally
         {
             _appCancellation = null;
+            _dashboard = null;
             Tui.Application.Shutdown();
         }
     }
@@ -333,9 +368,16 @@ internal sealed class DashboardApp
                 startedWork = true;
             }
 
-            if ((_repositories.Count > 0 || _settings.IgnoredPullRequests.Count > 0) && cleanup is null && DateTimeOffset.UtcNow >= _nextCleanup)
+            if ((_repositories.Count > 0
+                    || _settings.IgnoredPullRequests.Count > 0
+                    || _settings.TopPullRequests.Count > 0)
+                && cleanup is null
+                && DateTimeOffset.UtcNow >= _nextCleanup)
             {
-                cleanup = new NotificationCleaner(_repositories, _settings.IgnoredPullRequests).CleanupAsync(cancellationToken);
+                cleanup = new NotificationCleaner(
+                    _repositories,
+                    _settings.IgnoredPullRequests,
+                    _settings.TopPullRequests).CleanupAsync(cancellationToken);
                 startedWork = true;
             }
 
@@ -476,6 +518,10 @@ internal sealed class DashboardApp
         }
 
         _items = items;
+        if (!result.IsPartial && !updateSuccessfulPriorities)
+        {
+            _recentlyAcknowledgedCodexPullRequests = new Dictionary<string, PullRequestInfo>(StringComparer.OrdinalIgnoreCase);
+        }
         _lastRefresh = DateTimeOffset.UtcNow;
         _nextRefresh = _lastRefresh.Value.Add(RefreshInterval);
         _apiCalls = result.ApiCalls;
@@ -505,11 +551,21 @@ internal sealed class DashboardApp
 
     private void ApplyCleanupResult(CleanupResult result)
     {
-        if (_settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests))
+        var ignoredChanged = _settings.RemoveIgnoredPullRequests(result.RemovedIgnoredPullRequests);
+        var topChanged = _settings.RemoveTopPullRequests(result.RemovedTopPullRequests);
+        if (ignoredChanged || topChanged)
         {
             _settings.Save();
             _settingsLastWriteUtc = GetSettingsLastWriteUtc();
-            RefreshIgnoredPullRequests();
+            if (ignoredChanged)
+            {
+                RefreshIgnoredPullRequests();
+            }
+
+            if (topChanged)
+            {
+                RefreshTopPullRequests();
+            }
         }
 
         _lastCleanup = DateTimeOffset.UtcNow;
@@ -557,6 +613,18 @@ internal sealed class DashboardApp
             changed = true;
         }
 
+        if (_settings.ReplaceTopPullRequests(latest.TopPullRequests))
+        {
+            RefreshTopPullRequests();
+            changed = true;
+        }
+
+        if (_settings.ReplaceCodexReview(latest.CodexReview))
+        {
+            _codexReviewWatcher.Wake();
+            changed = true;
+        }
+
         if (_settings.ReplacePriority(latest.Priority))
         {
             RequestRefresh();
@@ -570,23 +638,100 @@ internal sealed class DashboardApp
     {
         var search = titleSearch.Trim();
         var includeIgnored = search.Length > 0 || _showIgnoredPullRequests;
-        var source = includeIgnored
-            ? _items
-            : _items.Where(item => !IsIgnored(item));
-
-        if (search.Length == 0)
+        var pendingReviewedKeys = _codexReviewSnapshot.PendingReviewedPullRequests
+            .Select(pullRequest => pullRequest.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var allItems = new List<PullRequestInfo>(
+            _items.Count + pendingReviewedKeys.Count + _recentlyAcknowledgedCodexPullRequests.Count);
+        var knownKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in _items)
         {
-            return source.ToArray();
+            if (knownKeys.Add(item.Key))
+            {
+                allItems.Add(item);
+            }
         }
 
-        return source
-            .Where(item => item.Title.Contains(search, StringComparison.CurrentCultureIgnoreCase))
+        foreach (var item in _recentlyAcknowledgedCodexPullRequests.Values)
+        {
+            if (knownKeys.Add(item.Key))
+            {
+                allItems.Add(item);
+            }
+        }
+
+        foreach (var reviewed in _codexReviewSnapshot.PendingReviewedPullRequests)
+        {
+            if (knownKeys.Add(reviewed.Key))
+            {
+                allItems.Add(reviewed.ToPullRequestInfo(
+                    _settings.Priority,
+                    _currentUserLogin,
+                    DateTimeOffset.UtcNow));
+            }
+        }
+
+        var source = includeIgnored
+            ? allItems
+            : allItems.Where(item => !IsIgnored(item) || pendingReviewedKeys.Contains(item.Key));
+        var filtered = search.Length == 0
+            ? source.ToArray()
+            : source
+                .Where(item => item.Title.Contains(search, StringComparison.CurrentCultureIgnoreCase))
+                .ToArray();
+
+        return SortTopFirst(filtered);
+    }
+
+    private IReadOnlyList<PullRequestInfo> SortTopFirst(IReadOnlyList<PullRequestInfo> source)
+    {
+        if (source.Count == 0)
+        {
+            return source;
+        }
+
+        var byKey = source.ToDictionary(item => item.Key, StringComparer.OrdinalIgnoreCase);
+        var reviewedKeys = _codexReviewSnapshot.PendingReviewedPullRequests
+            .Select(pullRequest => pullRequest.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var reviewed = _codexReviewSnapshot.PendingReviewedPullRequests
+            .Select(pullRequest => pullRequest.Key)
+            .Where(key => byKey.ContainsKey(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(key => byKey[key]);
+        var topKeys = _topPullRequestKeys;
+        var top = _settings.TopPullRequests
+            .Select(pr => pr.Key)
+            .Where(key => byKey.ContainsKey(key) && !reviewedKeys.Contains(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(key => byKey[key]);
+        var rest = source
+            .Where(item => !reviewedKeys.Contains(item.Key) && !topKeys.Contains(item.Key));
+
+        return reviewed.Concat(top).Concat(rest)
             .ToArray();
     }
 
     private bool IsIgnored(PullRequestInfo pullRequest)
     {
         return _ignoredPullRequestKeys.Contains(pullRequest.Key);
+    }
+
+    private bool IsTop(PullRequestInfo pullRequest)
+    {
+        return _topPullRequestKeys.Contains(pullRequest.Key);
+    }
+
+    private bool IsCodexReviewed(PullRequestInfo pullRequest)
+    {
+        return _codexReviewSnapshot.PendingReviewedPullRequests.Any(
+            reviewed => string.Equals(reviewed.Key, pullRequest.Key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private CodexReviewedPullRequest? CodexReviewFor(PullRequestInfo pullRequest)
+    {
+        return _codexReviewSnapshot.PendingReviewedPullRequests.FirstOrDefault(
+            reviewed => string.Equals(reviewed.Key, pullRequest.Key, StringComparison.OrdinalIgnoreCase));
     }
 
     private bool ToggleIgnored(PullRequestInfo pullRequest)
@@ -603,7 +748,115 @@ internal sealed class DashboardApp
         _settings.Save();
         _settingsLastWriteUtc = GetSettingsLastWriteUtc();
         RefreshIgnoredPullRequests();
+        _codexReviewWatcher.Wake();
         return true;
+    }
+
+    private bool ToggleTop(PullRequestInfo pullRequest)
+    {
+        if (IsTop(pullRequest))
+        {
+            _settings.RemoveTopPullRequests([TopPullRequest.From(pullRequest)]);
+        }
+        else if (!_settings.AddTopPullRequest(TopPullRequest.From(pullRequest)))
+        {
+            return false;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        RefreshTopPullRequests();
+        return true;
+    }
+
+    private void RefreshTopPullRequests()
+    {
+        _topPullRequestKeys = _settings.TopPullRequestKeys;
+    }
+
+    private bool ToggleCodexReview()
+    {
+        var enabled = !_settings.CodexReview.Enabled;
+        if (!_settings.SetCodexReviewEnabled(enabled))
+        {
+            return false;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _codexReviewSnapshot = _codexReviewSnapshot with
+        {
+            Enabled = enabled,
+            Message = enabled
+                ? $"{_settings.CodexReview.AgentDescriptor} review starting"
+                : $"{_settings.CodexReview.AgentDescriptor} review off",
+        };
+        _codexReviewWatcher.Wake();
+        return true;
+    }
+
+    private bool ToggleCodexReviewAutoSubmit()
+    {
+        var autoSubmit = !_settings.CodexReview.AutoSubmit;
+        if (!_settings.SetCodexReviewAutoSubmit(autoSubmit))
+        {
+            return false;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _codexReviewSnapshot = _codexReviewSnapshot with
+        {
+            Message = autoSubmit
+                ? $"{_settings.CodexReview.AgentDescriptor} auto-send on"
+                : $"{_settings.CodexReview.AgentDescriptor} drafts only",
+        };
+        _codexReviewWatcher.Wake();
+        return true;
+    }
+
+    private bool AcknowledgeCodexReview(PullRequestInfo pullRequest)
+    {
+        if (!_codexReviewWatcher.Acknowledge(pullRequest.Key))
+        {
+            return false;
+        }
+
+        _recentlyAcknowledgedCodexPullRequests = new Dictionary<string, PullRequestInfo>(
+            _recentlyAcknowledgedCodexPullRequests,
+            StringComparer.OrdinalIgnoreCase)
+        {
+            [pullRequest.Key] = pullRequest,
+        };
+        return true;
+    }
+
+    private bool IsCodexReviewQueued(PullRequestInfo pullRequest)
+    {
+        return _codexReviewWatcher.IsManuallyQueued(pullRequest.Key);
+    }
+
+    private void EnqueueCodexReview(PullRequestInfo pullRequest)
+    {
+        _codexReviewWatcher.Enqueue(pullRequest);
+    }
+
+    private void ApplyCodexReviewSnapshot(CodexReviewSnapshot snapshot)
+    {
+        _codexReviewSnapshot = snapshot;
+        var dashboard = _dashboard;
+        if (dashboard is null)
+        {
+            return;
+        }
+
+        try
+        {
+            Tui.Application.MainLoop.Invoke(dashboard.RefreshCurrent);
+        }
+        catch
+        {
+        }
     }
 
     private bool ToggleIgnoredVisibility()
@@ -626,7 +879,14 @@ internal sealed class DashboardApp
 
     private bool CanCleanup()
     {
-        return _repositories.Count > 0 || _settings.IgnoredPullRequests.Count > 0;
+        return _repositories.Count > 0
+            || _settings.IgnoredPullRequests.Count > 0
+            || _settings.TopPullRequests.Count > 0;
+    }
+
+    private Task<WeeklyStats> FetchWeeklyStatsAsync(CancellationToken cancellationToken)
+    {
+        return _client.FetchWeeklyStatsAsync(_repositories, cancellationToken);
     }
 
     private string RepositorySummary()
@@ -752,6 +1012,7 @@ internal sealed class DashboardApp
 
         private readonly DashboardApp _owner;
         private IReadOnlyList<PullRequestInfo> _visiblePullRequests = [];
+        private IReadOnlyList<TableRowBinding> _tableRows = [];
         private ColumnLayout _columns = ColumnLayout.Default;
         private Tui.View _searchBar = null!;
         private Tui.TextField _searchField = null!;
@@ -945,6 +1206,7 @@ internal sealed class DashboardApp
             _status.ColorScheme = isRefreshing ? YellowScheme : GreenScheme;
             _summary.Text = SummaryText();
             _scan.Text = ScanText();
+            _scan.ColorScheme = CodexStatusColor();
             _footer.Text = FooterText();
             LayoutContentViews();
 
@@ -959,13 +1221,19 @@ internal sealed class DashboardApp
 
             var previousRow = _table.SelectedRow;
             var previousColumn = _table.SelectedColumn;
+            var previousSelectedKey = SelectedPullRequest()?.Key;
             var table = BuildDataTable();
             _table.Table = table;
             _table.Style = BuildTableStyle(table);
 
-            if (_visiblePullRequests.Count > 0)
+            if (_tableRows.Count > 0)
             {
-                _table.SelectedRow = Math.Clamp(previousRow, 0, _visiblePullRequests.Count - 1);
+                var selectedRow = previousSelectedKey is null
+                    ? -1
+                    : FindTableRow(previousSelectedKey);
+                _table.SelectedRow = selectedRow >= 0
+                    ? selectedRow
+                    : Math.Clamp(previousRow, 0, _tableRows.Count - 1);
                 _table.SelectedColumn = Math.Clamp(previousColumn, 0, IgnoreColumn);
             }
             else
@@ -974,9 +1242,15 @@ internal sealed class DashboardApp
                 _table.SelectedColumn = 0;
             }
 
+            _footer.Text = FooterText();
             _table.Update();
             _table.SetNeedsDisplay();
             Tui.Application.Refresh();
+        }
+
+        public void RefreshCurrent()
+        {
+            Refresh(_isRefreshing, _isCleaning);
         }
 
         private bool ShouldShowInitialLoading()
@@ -1093,6 +1367,7 @@ internal sealed class DashboardApp
         private DataTable BuildDataTable()
         {
             var table = new DataTable();
+            var rows = new List<TableRowBinding>();
             table.Columns.Add(FitCell("Repo", _columns.Repo));
             table.Columns.Add(FitCell("PR", _columns.PullRequest));
             table.Columns.Add(FitCell("Title", _columns.Title));
@@ -1115,17 +1390,50 @@ internal sealed class DashboardApp
                     FitCell("", _columns.Created),
                     FitCell("", _columns.Approval),
                     FitCell("", _columns.Ignore));
+                rows.Add(TableRowBinding.Empty);
+                _tableRows = rows;
                 return table;
             }
 
-            foreach (var pullRequest in _visiblePullRequests)
+            TableSection? previousSection = null;
+            for (var index = 0; index < _visiblePullRequests.Count; index++)
             {
+                var pullRequest = _visiblePullRequests[index];
+                var section = SectionFor(pullRequest);
+                if (previousSection is not null && section != previousSection)
+                {
+                    table.Rows.Add(
+                        FitCell("", _columns.Repo),
+                        FitCell("", _columns.PullRequest),
+                        FitCell(SectionSeparator(section, _columns.Title - 2), _columns.Title),
+                        FitCell("", _columns.Author),
+                        FitCell("", _columns.Created),
+                        FitCell("", _columns.Approval),
+                        FitCell("", _columns.Ignore));
+                    rows.Add(TableRowBinding.Separator);
+                }
+
+                previousSection = section;
                 var approvers = pullRequest.Approvers.Count == 0
                     ? "none"
                     : Truncate(string.Join(", ", pullRequest.Approvers), 36);
                 var title = _owner.IsIgnored(pullRequest)
                     ? $"(ignored) {pullRequest.Title}"
                     : pullRequest.Title;
+                if (_owner.CodexReviewFor(pullRequest) is { } codexReview)
+                {
+                    var result = codexReview.FindingCount == 0
+                        ? "clean"
+                        : $"{codexReview.FindingCount.ToString(CultureInfo.InvariantCulture)} issue(s)";
+                    var delivery = codexReview.IsDryRun
+                        ? "local"
+                        : codexReview.ReviewSubmitted
+                            ? "sent"
+                            : codexReview.ReviewCreated
+                                ? "draft"
+                                : "complete";
+                    title = $"[{codexReview.AgentDisplayName} {delivery} {result}] {title}";
+                }
 
                 table.Rows.Add(
                     FitCell(pullRequest.Repository.Name, _columns.Repo),
@@ -1135,9 +1443,28 @@ internal sealed class DashboardApp
                     FitCell(pullRequest.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture), _columns.Created),
                     FitCell($"{pullRequest.ApprovalCount.ToString(CultureInfo.InvariantCulture)}/{_owner._requiredApprovals.ToString(CultureInfo.InvariantCulture)} {approvers}", _columns.Approval),
                     FitCell(_owner.IsIgnored(pullRequest) ? "unignore" : "ignore", _columns.Ignore, Tui.TextAlignment.Centered));
+                rows.Add(new TableRowBinding(pullRequest));
             }
 
+            _tableRows = rows;
             return table;
+        }
+
+        private TableSection SectionFor(PullRequestInfo pullRequest)
+        {
+            return _owner.IsCodexReviewed(pullRequest)
+                ? TableSection.CodexReviewed
+                : _owner.IsTop(pullRequest)
+                    ? TableSection.Top
+                    : TableSection.Regular;
+        }
+
+        private static string SectionSeparator(TableSection nextSection, int width)
+        {
+            var label = nextSection == TableSection.Top ? " Top PRs " : " Other PRs ";
+            var dashCount = Math.Max(3, width - label.Length);
+            var left = dashCount / 2;
+            return new string('-', left) + label + new string('-', dashCount - left);
         }
 
         private Tui.TableView.TableStyle BuildTableStyle(DataTable table)
@@ -1149,9 +1476,8 @@ internal sealed class DashboardApp
                 ShowVerticalCellLines = true,
                 ShowHorizontalScrollIndicators = false,
                 ExpandLastColumn = false,
-                RowColorGetter = args => args.RowIndex >= 0
-                    && args.RowIndex < _visiblePullRequests.Count
-                    && _owner.IsIgnored(_visiblePullRequests[args.RowIndex])
+                RowColorGetter = args => RowPullRequest(args.RowIndex) is { } pullRequest
+                    && _owner.IsIgnored(pullRequest)
                         ? IgnoredScheme
                         : GrayScheme,
             };
@@ -1208,42 +1534,44 @@ internal sealed class DashboardApp
 
         private Tui.ColorScheme ApprovalColor(Tui.TableView.CellColorGetterArgs args)
         {
-            if (args.RowIndex < 0 || args.RowIndex >= _visiblePullRequests.Count)
+            var pullRequest = RowPullRequest(args.RowIndex);
+            if (pullRequest is null)
             {
                 return GrayScheme;
             }
 
-            return _visiblePullRequests[args.RowIndex].ApprovalCount == 0
+            return pullRequest.ApprovalCount == 0
                 ? RedScheme
                 : YellowScheme;
         }
 
         private Tui.ColorScheme LinkColor(Tui.TableView.CellColorGetterArgs args)
         {
-            if (args.RowIndex < 0)
+            var pullRequest = RowPullRequest(args.RowIndex);
+            if (pullRequest is null)
             {
                 return GrayScheme;
             }
 
-            return args.RowIndex < _visiblePullRequests.Count
-                && _owner.IsIgnored(_visiblePullRequests[args.RowIndex])
+            return _owner.IsIgnored(pullRequest)
                     ? IgnoredScheme
                     : LinkScheme;
         }
 
         private Tui.ColorScheme PullRequestColor(Tui.TableView.CellColorGetterArgs args)
         {
-            if (args.RowIndex < 0 || args.RowIndex >= _visiblePullRequests.Count)
+            var pullRequest = RowPullRequest(args.RowIndex);
+            if (pullRequest is null)
             {
                 return GrayScheme;
             }
 
-            if (_owner.IsIgnored(_visiblePullRequests[args.RowIndex]))
+            if (_owner.IsIgnored(pullRequest))
             {
                 return IgnoredScheme;
             }
 
-            return HeatColor(_visiblePullRequests[args.RowIndex].Priority.Heat);
+            return HeatColor(pullRequest.Priority.Heat);
         }
 
         private static Tui.ColorScheme HeatColor(PullRequestHeat heat)
@@ -1312,15 +1640,62 @@ internal sealed class DashboardApp
 
         private string ScanText()
         {
-            var scanText = _owner._currentUserLogin is null
-                ? $"{_owner._openNonDraftCount} open non-draft PRs matched, {_owner._apiCalls} request page(s)"
-                : $"{_owner._openNonDraftCount} open non-draft PRs matched, excluding @{_owner._currentUserLogin}, {_owner._apiCalls} request page(s)";
-            if (_owner._ignoredPullRequestCount > 0)
+            var pendingReviews = _owner._codexReviewSnapshot.PendingReviewedPullRequests.Count;
+            var scanText = Truncate(_owner._codexReviewSnapshot.Message, 42);
+            scanText += $", {_owner._codexReviewSnapshot.WaitingCount.ToString(CultureInfo.InvariantCulture)} pending";
+            if (_owner._codexReviewSnapshot.NextReadyAt is { } nextReadyAt)
             {
-                scanText += $", {_owner._ignoredPullRequestCount} ignored";
+                var remaining = nextReadyAt - DateTimeOffset.UtcNow;
+                if (remaining > TimeSpan.Zero)
+                {
+                    scanText += remaining.TotalMinutes >= 1
+                        ? $", next in {Math.Ceiling(remaining.TotalMinutes).ToString(CultureInfo.InvariantCulture)}m"
+                        : $", next in {Math.Ceiling(remaining.TotalSeconds).ToString(CultureInfo.InvariantCulture)}s";
+                }
             }
 
-            return scanText;
+            if (pendingReviews > 0)
+            {
+                scanText += $", {pendingReviews.ToString(CultureInfo.InvariantCulture)} new";
+            }
+
+            if (_owner._codexReviewSnapshot.ManualQueueCount > 0)
+            {
+                scanText += $", {_owner._codexReviewSnapshot.ManualQueueCount.ToString(CultureInfo.InvariantCulture)} manual queued";
+            }
+
+            scanText += $" | {_owner._openNonDraftCount.ToString(CultureInfo.InvariantCulture)} matched, {_owner._apiCalls.ToString(CultureInfo.InvariantCulture)} API call(s)";
+            if (_owner._ignoredPullRequestCount > 0)
+            {
+                scanText += $", {_owner._ignoredPullRequestCount.ToString(CultureInfo.InvariantCulture)} ignored";
+            }
+
+            var availableWidth = _scan.Bounds.Width > 0 ? _scan.Bounds.Width : 72;
+            return Truncate(scanText, Math.Max(20, availableWidth - 1));
+        }
+
+        private Tui.ColorScheme CodexStatusColor()
+        {
+            var message = _owner._codexReviewSnapshot.Message;
+            if (message.Contains("error", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("failed", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("rejected", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("cannot queue", StringComparison.OrdinalIgnoreCase))
+            {
+                return RedScheme;
+            }
+
+            if (message.Contains("reviewing", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("scanning", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("starting", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("waiting", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("queued", StringComparison.OrdinalIgnoreCase)
+                || _owner._codexReviewSnapshot.ManualQueueCount > 0)
+            {
+                return YellowScheme;
+            }
+
+            return !_owner._codexReviewSnapshot.Enabled ? IgnoredScheme : GreenScheme;
         }
 
         private string SummaryText()
@@ -1336,11 +1711,22 @@ internal sealed class DashboardApp
 
         private string FooterText()
         {
-            var ignore = _visiblePullRequests.Count == 0
+            var selectedPullRequest = SelectedPullRequest();
+            var ignore = selectedPullRequest is null
                 ? "I ignore disabled"
-                : SelectedPullRequest() is { } selected && _owner.IsIgnored(selected)
+                : _owner.IsIgnored(selectedPullRequest)
                     ? "I unignore"
                     : "I ignore";
+            var top = selectedPullRequest is null
+                ? "T top disabled"
+                : _owner.IsTop(selectedPullRequest)
+                    ? "T untop"
+                    : "T top";
+            var enqueue = selectedPullRequest is null
+                ? "E force disabled"
+                : _owner.IsCodexReviewQueued(selectedPullRequest)
+                    ? "E forced"
+                    : "E force review";
             var reveal = _owner._showIgnoredPullRequests ? "Ctrl+I hide ignored" : "Ctrl+I show ignored";
             var refresh = _isRefreshing ? "refreshing..." : "R refresh";
             var cleanup = !_owner.CanCleanup()
@@ -1353,15 +1739,40 @@ internal sealed class DashboardApp
             var search = string.IsNullOrWhiteSpace(_titleSearch)
                 ? (_isSearchActive ? "Esc cancel search" : "F1 search")
                 : $"F1 search '{Truncate(_titleSearch, 20)}'  Esc cancel search";
-            return $"Up/Down scroll  Enter open  Click Title open  Click Ignore toggle  {ignore}  {reveal}  {search}  {refresh}  {cleanup}  Q quit{suffix}";
+            var reviewAgent = _owner._settings.CodexReview.AgentDisplayName;
+            var codexReview = _owner._settings.CodexReview.Enabled
+                ? $"V {reviewAgent} off"
+                : $"V {reviewAgent} on";
+            var autoSubmit = _owner._settings.CodexReview.AutoSubmit
+                ? "A auto-send:on"
+                : "A auto-send:off";
+            return $"Up/Down scroll  Enter open  Click Title open/ack  Click Ignore toggle  {ignore}  {top}  {enqueue}  {codexReview}  {autoSubmit}  S stats  {reveal}  {search}  {refresh}  {cleanup}  Q quit{suffix}";
         }
 
         private PullRequestInfo? SelectedPullRequest()
         {
-            var row = _table.SelectedRow;
-            return row >= 0 && row < _visiblePullRequests.Count
-                ? _visiblePullRequests[row]
+            return RowPullRequest(_table.SelectedRow);
+        }
+
+        private PullRequestInfo? RowPullRequest(int row)
+        {
+            return row >= 0 && row < _tableRows.Count
+                ? _tableRows[row].PullRequest
                 : null;
+        }
+
+        private int FindTableRow(string pullRequestKey)
+        {
+            for (var row = 0; row < _tableRows.Count; row++)
+            {
+                if (_tableRows[row].PullRequest is { } pullRequest
+                    && string.Equals(pullRequest.Key, pullRequestKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    return row;
+                }
+            }
+
+            return -1;
         }
 
         private void HandleKeyPress(Tui.View.KeyEventEventArgs args)
@@ -1410,6 +1821,49 @@ internal sealed class DashboardApp
                 return;
             }
 
+            if (!isCtrl && (key == Tui.Key.T || key == Tui.Key.t))
+            {
+                ToggleSelectedTop();
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.E || key == Tui.Key.e))
+            {
+                EnqueueSelectedReview();
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.V || key == Tui.Key.v))
+            {
+                if (_owner.ToggleCodexReview())
+                {
+                    Refresh(_isRefreshing, _isCleaning);
+                }
+
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.A || key == Tui.Key.a))
+            {
+                if (_owner.ToggleCodexReviewAutoSubmit())
+                {
+                    Refresh(_isRefreshing, _isCleaning);
+                }
+
+                args.Handled = true;
+                return;
+            }
+
+            if (!isCtrl && (key == Tui.Key.S || key == Tui.Key.s))
+            {
+                ShowStatsDialog();
+                args.Handled = true;
+                return;
+            }
+
             if (!isCtrl && (key == Tui.Key.R || key == Tui.Key.r) && !_isRefreshing)
             {
                 _owner.RequestRefresh();
@@ -1449,12 +1903,12 @@ internal sealed class DashboardApp
 
         private void ActivateCell(int column, int row)
         {
-            if (row < 0 || row >= _visiblePullRequests.Count)
+            var pullRequest = RowPullRequest(row);
+            if (pullRequest is null)
             {
                 return;
             }
 
-            var pullRequest = _visiblePullRequests[row];
             switch (column)
             {
                 case PullRequestColumn:
@@ -1462,7 +1916,13 @@ internal sealed class DashboardApp
                     break;
 
                 case TitleColumn:
+                    if (_owner.IsCodexReviewed(pullRequest))
+                    {
+                        _owner.AcknowledgeCodexReview(pullRequest);
+                    }
+
                     PullRequests.OpenUrl(pullRequest.Url);
+                    Refresh(_isRefreshing, _isCleaning);
                     break;
 
                 case IgnoreColumn:
@@ -1495,7 +1955,7 @@ internal sealed class DashboardApp
                 Height = 3,
                 Text = $"{pullRequest.Repository.Name}  #{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}  {Truncate(pullRequest.Title, Math.Max(20, width - 28))}\n"
                     + $"Score {priority.Score.ToString(CultureInfo.InvariantCulture)} ({priority.Label}); hot >= {_owner._settings.Priority.HotThreshold.ToString(CultureInfo.InvariantCulture)}, super > {_owner._settings.Priority.SuperHotThreshold.ToString(CultureInfo.InvariantCulture)}\n"
-                    + $"Human commenters: {priority.HumanCommenterCount.ToString(CultureInfo.InvariantCulture)}; human reviewers: {priority.HumanReviewCount.ToString(CultureInfo.InvariantCulture)}; requested from you: {(priority.ReviewRequestedFromUser ? "yes" : "no")}",
+                    + $"Human commenters/approvers: {priority.HumanCommenterCount.ToString(CultureInfo.InvariantCulture)}; human reviewers: {priority.HumanReviewCount.ToString(CultureInfo.InvariantCulture)}; requested from you: {(priority.ReviewRequestedFromUser ? "yes" : "no")}",
             };
 
             var table = new Tui.TableView
@@ -1517,6 +1977,103 @@ internal sealed class DashboardApp
             table.SetFocus();
             Tui.Application.Run(dialog);
             _table.SetFocus();
+        }
+
+        private void ShowStatsDialog()
+        {
+            var width = Math.Clamp(Tui.Application.Driver.Cols - 4, 58, 86);
+            var height = Math.Clamp(Tui.Application.Driver.Rows - 4, 12, 18);
+            var back = new Tui.Button("Back", true);
+            var dialog = new Tui.Dialog("This Week", width, height, back)
+            {
+                ColorScheme = GrayScheme,
+            };
+            var body = new Tui.Label
+            {
+                X = 1,
+                Y = 1,
+                Width = Tui.Dim.Fill(2),
+                Height = Tui.Dim.Fill(2),
+                Text = "Loading weekly stats...",
+            };
+
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                _owner._appCancellation?.Token ?? CancellationToken.None);
+            void Close()
+            {
+                cancellation.Cancel();
+                Tui.Application.RequestStop(dialog);
+            }
+
+            back.Clicked += Close;
+            dialog.KeyPress += args =>
+            {
+                var key = BaseKey(args.KeyEvent.Key);
+                if (key == Tui.Key.Esc || key == Tui.Key.B || key == Tui.Key.b)
+                {
+                    Close();
+                    args.Handled = true;
+                }
+            };
+
+            dialog.Add(body);
+            _ = LoadStatsDialogAsync(body, cancellation.Token);
+
+            Tui.Application.Run(dialog);
+            _table.SetFocus();
+        }
+
+        private async Task LoadStatsDialogAsync(Tui.Label body, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var stats = await _owner.FetchWeeklyStatsAsync(cancellationToken);
+                UpdateStatsDialog(body, FormatWeeklyStats(stats), GrayScheme);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                UpdateStatsDialog(body, $"Failed to load weekly stats:\n{ex.Message}", RedScheme);
+            }
+        }
+
+        private static void UpdateStatsDialog(Tui.Label body, string text, Tui.ColorScheme colorScheme)
+        {
+            try
+            {
+                Tui.Application.MainLoop.Invoke(() =>
+                {
+                    body.Text = text;
+                    body.ColorScheme = colorScheme;
+                    body.SetNeedsDisplay();
+                    Tui.Application.Refresh();
+                });
+            }
+            catch
+            {
+            }
+        }
+
+        private static string FormatWeeklyStats(WeeklyStats stats)
+        {
+            var start = stats.WeekStartLocal.ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture);
+            var end = stats.WeekEndLocal.ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture);
+            var scope = stats.TrackedRepositoryCount == 0
+                ? "no tracked repositories"
+                : stats.TrackedRepositoryCount == 1
+                    ? "1 tracked repository"
+                    : $"{stats.TrackedRepositoryCount.ToString(CultureInfo.InvariantCulture)} tracked repositories";
+
+            return $"@{stats.UserLogin}\n\n"
+                + $"Created PRs: {stats.CreatedPullRequestCount.ToString(CultureInfo.InvariantCulture)} non-draft, open or merged\n"
+                + $"Reviews submitted: {stats.ReviewCount.ToString(CultureInfo.InvariantCulture)}\n\n"
+                + $"From: {start}\n"
+                + $"To:   {end}\n"
+                + $"Scope: {scope}\n"
+                + $"GitHub search pages: {stats.ApiCalls.ToString(CultureInfo.InvariantCulture)}\n\n"
+                + "Esc or B returns";
         }
 
         private static DataTable BuildPriorityTable(PullRequestPriority priority)
@@ -1615,6 +2172,32 @@ internal sealed class DashboardApp
             }
         }
 
+        private void ToggleSelectedTop()
+        {
+            var selected = SelectedPullRequest();
+            if (selected is null)
+            {
+                return;
+            }
+
+            if (_owner.ToggleTop(selected))
+            {
+                Refresh(_isRefreshing, _isCleaning);
+            }
+        }
+
+        private void EnqueueSelectedReview()
+        {
+            var selected = SelectedPullRequest();
+            if (selected is null)
+            {
+                return;
+            }
+
+            _owner.EnqueueCodexReview(selected);
+            Refresh(_isRefreshing, _isCleaning);
+        }
+
         private static Tui.Key BaseKey(Tui.Key key)
         {
             return key & ~(Tui.Key.CtrlMask | Tui.Key.AltMask | Tui.Key.ShiftMask);
@@ -1623,6 +2206,13 @@ internal sealed class DashboardApp
         private static bool HasModifier(Tui.Key key, Tui.Key modifier)
         {
             return (key & modifier) == modifier;
+        }
+
+        private enum TableSection
+        {
+            CodexReviewed,
+            Top,
+            Regular,
         }
 
         private readonly record struct ColumnLayout(
@@ -1635,6 +2225,13 @@ internal sealed class DashboardApp
             int Ignore)
         {
             public static ColumnLayout Default { get; } = new(12, 8, 20, 10, 12, 10, 10);
+        }
+
+        private sealed record TableRowBinding(PullRequestInfo? PullRequest)
+        {
+            public static TableRowBinding Empty { get; } = new((PullRequestInfo?)null);
+
+            public static TableRowBinding Separator { get; } = new((PullRequestInfo?)null);
         }
     }
 
@@ -1675,9 +2272,9 @@ internal sealed class GhClient
     public const int MaxSearchResults = 1_000;
     public const int MaxSearchPages = MaxSearchResults / SearchPageSize;
     private const int MaxSearchQueryLength = 1_800;
-    private static readonly TimeSpan GhApiTimeout = TimeSpan.FromMinutes(3);
     private string? _currentUserLogin;
     private bool _currentUserLoginResolved;
+    private readonly ConcurrentDictionary<string, PriorityDetail> _priorityDetails = new(StringComparer.Ordinal);
 
     private static readonly string GraphQlQuery = $$"""
         query($searchText: String!, $after: String) {
@@ -1694,6 +2291,8 @@ internal sealed class GhClient
                 title
                 url
                 createdAt
+                updatedAt
+                authorAssociation
                 author {
                   login
                 }
@@ -1704,6 +2303,52 @@ internal sealed class GhClient
                 latestOpinionatedReviews(first: 20) {
                   nodes {
                     state
+                    author {
+                      login
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    private static readonly string WeeklyCreatedPullRequestsQuery = $$"""
+        query($searchText: String!, $after: String) {
+          search(query: $searchText, type: ISSUE, first: {{SearchPageSize}}, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              ... on PullRequest {
+                createdAt
+                isDraft
+                merged
+                state
+                author {
+                  login
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    private static readonly string WeeklyReviewedPullRequestsQuery = $$"""
+        query($searchText: String!, $after: String, $reviewAuthor: String!) {
+          search(query: $searchText, type: ISSUE, first: {{SearchPageSize}}, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              ... on PullRequest {
+                reviews(last: 100, author: $reviewAuthor) {
+                  nodes {
+                    state
+                    submittedAt
                     author {
                       login
                     }
@@ -1757,6 +2402,55 @@ internal sealed class GhClient
             : result;
     }
 
+    public async Task<WeeklyStats> FetchWeeklyStatsAsync(
+        IReadOnlyList<RepositoryRef> repositories,
+        CancellationToken cancellationToken)
+    {
+        var currentUserLogin = await GetCurrentUserLoginAsync(cancellationToken)
+            ?? throw new InvalidOperationException("failed to resolve GitHub user");
+        var nowLocal = DateTimeOffset.Now;
+        var weekStartLocal = StartOfWeek(nowLocal, DayOfWeek.Monday);
+        if (repositories.Count == 0)
+        {
+            return new WeeklyStats(
+                currentUserLogin,
+                weekStartLocal,
+                nowLocal,
+                TrackedRepositoryCount: 0,
+                CreatedPullRequestCount: 0,
+                ReviewCount: 0,
+                ApiCalls: 0);
+        }
+
+        var sinceUtc = weekStartLocal.ToUniversalTime();
+        var untilUtc = nowLocal.ToUniversalTime();
+        var searchSinceDate = sinceUtc.Date;
+        var created = FetchWeeklyCreatedPullRequestCountAsync(
+            repositories,
+            currentUserLogin,
+            sinceUtc,
+            untilUtc,
+            searchSinceDate,
+            cancellationToken);
+        var reviewed = FetchWeeklyReviewCountAsync(
+            repositories,
+            currentUserLogin,
+            sinceUtc,
+            untilUtc,
+            searchSinceDate,
+            cancellationToken);
+
+        await Task.WhenAll(created, reviewed);
+        return new WeeklyStats(
+            currentUserLogin,
+            weekStartLocal,
+            nowLocal,
+            repositories.Count,
+            created.Result.Count,
+            reviewed.Result.Count,
+            created.Result.ApiCalls + reviewed.Result.ApiCalls);
+    }
+
     public async Task<FetchResult> EnrichPullRequestPrioritiesAsync(
         FetchResult result,
         PrioritySettings priority,
@@ -1767,40 +2461,44 @@ internal sealed class GhClient
             return result;
         }
 
-        var chunks = result.Items
+        var activeNodeIds = result.Items
             .Where(item => !string.IsNullOrWhiteSpace(item.NodeId))
-            .Chunk(20)
-            .ToArray();
-        if (chunks.Length == 0)
+            .Select(item => item.NodeId)
+            .ToHashSet(StringComparer.Ordinal);
+        if (activeNodeIds.Count == 0)
         {
             return result;
         }
 
-        var priorities = new ConcurrentDictionary<string, PullRequestPriority>(StringComparer.Ordinal);
+        foreach (var cachedNodeId in _priorityDetails.Keys)
+        {
+            if (!activeNodeIds.Contains(cachedNodeId))
+            {
+                _priorityDetails.TryRemove(cachedNodeId, out _);
+            }
+        }
+
+        var chunks = result.Items
+            .Where(item => !string.IsNullOrWhiteSpace(item.NodeId)
+                && (!_priorityDetails.TryGetValue(item.NodeId, out var cached)
+                    || cached.UpdatedAt != item.UpdatedAt))
+            .Chunk(20)
+            .ToArray();
         var apiCalls = 0;
         var now = DateTimeOffset.UtcNow;
 
-        await Parallel.ForEachAsync(
-            chunks,
-            new ParallelOptions
+        foreach (var chunk in chunks)
+        {
+            var details = await FetchPriorityDetailsChunkAsync(chunk, cancellationToken);
+            apiCalls++;
+            foreach (var detail in details)
             {
-                CancellationToken = cancellationToken,
-                MaxDegreeOfParallelism = 4,
-            },
-            async (chunk, token) =>
-            {
-                var details = await FetchPriorityDetailsChunkAsync(chunk, priority, result.ExcludedAuthor, now, token);
-                Interlocked.Increment(ref apiCalls);
-                foreach (var detail in details)
-                {
-                    priorities[detail.NodeId] = detail.Priority;
-                }
-            });
+                _priorityDetails[detail.NodeId] = detail;
+            }
+        }
 
         var items = result.Items
-            .Select(item => priorities.TryGetValue(item.NodeId, out var updatedPriority)
-                ? item with { Priority = updatedPriority }
-                : item)
+            .Select(item => ApplyPriorityDetails(item, result.ExcludedAuthor, priority, now))
             .ToArray();
 
         return result with
@@ -1810,11 +2508,100 @@ internal sealed class GhClient
         };
     }
 
+    private static async Task<WeeklyCount> FetchWeeklyCreatedPullRequestCountAsync(
+        IReadOnlyList<RepositoryRef> repositories,
+        string currentUserLogin,
+        DateTimeOffset sinceUtc,
+        DateTimeOffset untilUtc,
+        DateTime searchSinceDate,
+        CancellationToken cancellationToken)
+    {
+        var count = 0;
+        var apiCalls = 0;
+
+        foreach (var batch in CreateSearchBatches(
+            repositories,
+            repos => BuildWeeklyCreatedPullRequestsSearchText(repos, currentUserLogin, searchSinceDate)))
+        {
+            var searchText = BuildWeeklyCreatedPullRequestsSearchText(batch, currentUserLogin, searchSinceDate);
+            string? cursor = null;
+            var hasNextPage = true;
+            var pages = 0;
+
+            while (hasNextPage && pages < MaxSearchPages)
+            {
+                pages++;
+                apiCalls++;
+                using var page = await RunGraphQlSearchPageAsync(
+                    WeeklyCreatedPullRequestsQuery,
+                    searchText,
+                    cursor,
+                    cancellationToken);
+                var search = page.RootElement.GetProperty("data").GetProperty("search");
+                foreach (var node in search.GetProperty("nodes").EnumerateArray())
+                {
+                    if (ShouldCountWeeklyCreatedPullRequest(node, currentUserLogin, sinceUtc, untilUtc))
+                    {
+                        count++;
+                    }
+                }
+
+                var pageInfo = search.GetProperty("pageInfo");
+                hasNextPage = pageInfo.GetProperty("hasNextPage").GetBoolean();
+                cursor = hasNextPage ? pageInfo.GetProperty("endCursor").GetString() : null;
+            }
+        }
+
+        return new WeeklyCount(count, apiCalls);
+    }
+
+    private static async Task<WeeklyCount> FetchWeeklyReviewCountAsync(
+        IReadOnlyList<RepositoryRef> repositories,
+        string currentUserLogin,
+        DateTimeOffset sinceUtc,
+        DateTimeOffset untilUtc,
+        DateTime searchSinceDate,
+        CancellationToken cancellationToken)
+    {
+        var count = 0;
+        var apiCalls = 0;
+
+        foreach (var batch in CreateSearchBatches(
+            repositories,
+            repos => BuildWeeklyReviewedPullRequestsSearchText(repos, currentUserLogin, searchSinceDate)))
+        {
+            var searchText = BuildWeeklyReviewedPullRequestsSearchText(batch, currentUserLogin, searchSinceDate);
+            string? cursor = null;
+            var hasNextPage = true;
+            var pages = 0;
+
+            while (hasNextPage && pages < MaxSearchPages)
+            {
+                pages++;
+                apiCalls++;
+                using var page = await RunGraphQlSearchPageAsync(
+                    WeeklyReviewedPullRequestsQuery,
+                    searchText,
+                    cursor,
+                    cancellationToken,
+                    ("reviewAuthor", currentUserLogin));
+                var search = page.RootElement.GetProperty("data").GetProperty("search");
+                foreach (var node in search.GetProperty("nodes").EnumerateArray())
+                {
+                    count += CountWeeklyReviews(node, currentUserLogin, sinceUtc, untilUtc);
+                }
+
+                var pageInfo = search.GetProperty("pageInfo");
+                hasNextPage = pageInfo.GetProperty("hasNextPage").GetBoolean();
+                cursor = hasNextPage ? pageInfo.GetProperty("endCursor").GetString() : null;
+            }
+        }
+
+        return new WeeklyCount(count, apiCalls);
+    }
+
     private static async Task<IReadOnlyList<PriorityDetail>> FetchPriorityDetailsChunkAsync(
         PullRequestInfo[] pullRequests,
-        PrioritySettings priority,
-        string? currentUserLogin,
-        DateTimeOffset now,
         CancellationToken cancellationToken)
     {
         using var document = await RunGraphQlQueryAsync(BuildPriorityDetailsQuery(pullRequests), cancellationToken);
@@ -1834,18 +2621,28 @@ internal sealed class GhClient
             var nodeId = node.TryGetProperty("id", out var idProperty)
                 ? idProperty.GetString() ?? pullRequest.NodeId
                 : pullRequest.NodeId;
-            var reviewRequestedFromUser = pullRequest.Priority.ReviewRequestedFromUser
-                || (!string.IsNullOrWhiteSpace(currentUserLogin)
-                    && ReviewRequestedUsers(node).Contains(currentUserLogin, StringComparer.OrdinalIgnoreCase));
-            var updatedPriority = CalculatePriority(
-                node,
-                pullRequest.Author,
-                pullRequest.CreatedAt,
-                reviewRequestedFromUser,
-                currentUserLogin,
-                priority,
-                now);
-            details.Add(new PriorityDetail(nodeId, updatedPriority));
+            var updatedAt = node.TryGetProperty("updatedAt", out var updatedAtProperty)
+                ? DateTimeOffset.Parse(
+                    updatedAtProperty.GetString() ?? "",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal)
+                : pullRequest.UpdatedAt;
+            var commentAuthors = CommentAuthors(node)
+                .Concat(ApprovalAuthors(node))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var reviewAuthors = ReviewAuthors(node)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var requestedReviewers = ReviewRequestedUsers(node)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            details.Add(new PriorityDetail(
+                nodeId,
+                updatedAt,
+                commentAuthors,
+                reviewAuthors,
+                requestedReviewers));
         }
 
         return details;
@@ -1865,6 +2662,7 @@ internal sealed class GhClient
                 .AppendLine(") {");
             builder.AppendLine("    ... on PullRequest {");
             builder.AppendLine("      id");
+            builder.AppendLine("      updatedAt");
             builder.AppendLine("      comments(first: 50) {");
             builder.AppendLine("        nodes {");
             builder.AppendLine("          author {");
@@ -1874,6 +2672,7 @@ internal sealed class GhClient
             builder.AppendLine("      }");
             builder.AppendLine("      reviews(first: 50) {");
             builder.AppendLine("        nodes {");
+            builder.AppendLine("          state");
             builder.AppendLine("          author {");
             builder.AppendLine("            login");
             builder.AppendLine("          }");
@@ -1901,6 +2700,31 @@ internal sealed class GhClient
 
         builder.AppendLine("}");
         return builder.ToString();
+    }
+
+    private PullRequestInfo ApplyPriorityDetails(
+        PullRequestInfo item,
+        string? currentUserLogin,
+        PrioritySettings priority,
+        DateTimeOffset now)
+    {
+        if (!_priorityDetails.TryGetValue(item.NodeId, out var details))
+        {
+            return item;
+        }
+
+        var reviewRequestedFromUser = item.Priority.ReviewRequestedFromUser
+            || (!string.IsNullOrWhiteSpace(currentUserLogin)
+                && details.RequestedReviewers.Contains(currentUserLogin, StringComparer.OrdinalIgnoreCase));
+        var updatedPriority = priority.Calculate(
+            item.CreatedAt,
+            item.Author,
+            currentUserLogin,
+            details.CommentAuthors,
+            details.ReviewAuthors,
+            reviewRequestedFromUser,
+            now);
+        return item with { Priority = updatedPriority };
     }
 
     private static async Task<FetchResult> FetchPullRequestBatchAsync(
@@ -1962,13 +2786,20 @@ internal sealed class GhClient
         IReadOnlyList<RepositoryRef> repositories,
         string? excludedAuthor)
     {
+        return CreateSearchBatches(repositories, repos => BuildSearchText(repos, excludedAuthor));
+    }
+
+    private static IReadOnlyList<IReadOnlyList<RepositoryRef>> CreateSearchBatches(
+        IReadOnlyList<RepositoryRef> repositories,
+        Func<IReadOnlyList<RepositoryRef>, string> buildSearchText)
+    {
         var batches = new List<IReadOnlyList<RepositoryRef>>();
         var current = new List<RepositoryRef>();
 
         foreach (var repo in repositories)
         {
             current.Add(repo);
-            if (BuildSearchText(current, excludedAuthor).Length <= MaxSearchQueryLength)
+            if (buildSearchText(current).Length <= MaxSearchQueryLength)
             {
                 continue;
             }
@@ -1997,6 +2828,103 @@ internal sealed class GhClient
         return $"{repoQualifiers} is:pr is:open draft:false{authorExclusion} sort:created-desc";
     }
 
+    private static string BuildWeeklyCreatedPullRequestsSearchText(
+        IReadOnlyList<RepositoryRef> repositories,
+        string currentUserLogin,
+        DateTime searchSinceDate)
+    {
+        var repoQualifiers = string.Join(" ", repositories.Select(repo => $"repo:{repo.FullName}"));
+        return $"{repoQualifiers} is:pr author:{currentUserLogin} created:>={searchSinceDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)} draft:false sort:created-desc";
+    }
+
+    private static string BuildWeeklyReviewedPullRequestsSearchText(
+        IReadOnlyList<RepositoryRef> repositories,
+        string currentUserLogin,
+        DateTime searchSinceDate)
+    {
+        var repoQualifiers = string.Join(" ", repositories.Select(repo => $"repo:{repo.FullName}"));
+        return $"{repoQualifiers} is:pr reviewed-by:{currentUserLogin} updated:>={searchSinceDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)} sort:updated-desc";
+    }
+
+    private static bool ShouldCountWeeklyCreatedPullRequest(
+        JsonElement node,
+        string currentUserLogin,
+        DateTimeOffset sinceUtc,
+        DateTimeOffset untilUtc)
+    {
+        if (!TryGetLogin(node, out var author)
+            || !string.Equals(author, currentUserLogin, StringComparison.OrdinalIgnoreCase)
+            || (node.TryGetProperty("isDraft", out var isDraft) && isDraft.GetBoolean()))
+        {
+            return false;
+        }
+
+        var createdAt = DateTimeOffset.Parse(
+            node.GetProperty("createdAt").GetString() ?? "",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal);
+        if (createdAt < sinceUtc || createdAt > untilUtc)
+        {
+            return false;
+        }
+
+        var state = node.TryGetProperty("state", out var stateProperty)
+            ? stateProperty.GetString()
+            : "";
+        var merged = node.TryGetProperty("merged", out var mergedProperty)
+            && mergedProperty.GetBoolean();
+        return !string.Equals(state, "CLOSED", StringComparison.Ordinal) || merged;
+    }
+
+    private static int CountWeeklyReviews(
+        JsonElement node,
+        string currentUserLogin,
+        DateTimeOffset sinceUtc,
+        DateTimeOffset untilUtc)
+    {
+        if (!node.TryGetProperty("reviews", out var reviews)
+            || !reviews.TryGetProperty("nodes", out var reviewNodes))
+        {
+            return 0;
+        }
+
+        var count = 0;
+        foreach (var review in reviewNodes.EnumerateArray())
+        {
+            if (!TryGetLogin(review, out var author)
+                || !string.Equals(author, currentUserLogin, StringComparison.OrdinalIgnoreCase)
+                || IsPendingReview(review)
+                || !review.TryGetProperty("submittedAt", out var submittedAtProperty)
+                || submittedAtProperty.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+
+            var submittedAt = DateTimeOffset.Parse(
+                submittedAtProperty.GetString() ?? "",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal);
+            if (submittedAt >= sinceUtc && submittedAt <= untilUtc)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static bool IsPendingReview(JsonElement review)
+    {
+        return review.TryGetProperty("state", out var state)
+            && string.Equals(state.GetString(), "PENDING", StringComparison.Ordinal);
+    }
+
+    private static DateTimeOffset StartOfWeek(DateTimeOffset value, DayOfWeek firstDayOfWeek)
+    {
+        var dayOffset = ((int)value.DayOfWeek - (int)firstDayOfWeek + 7) % 7;
+        return new DateTimeOffset(value.Date.AddDays(-dayOffset), value.Offset);
+    }
+
     private async Task<string?> GetCurrentUserLoginAsync(CancellationToken cancellationToken)
     {
         if (_currentUserLoginResolved)
@@ -2004,19 +2932,7 @@ internal sealed class GhClient
             return _currentUserLogin;
         }
 
-        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(20), "api", "user", "--jq", ".login");
-        if (result.ExitCode != 0)
-        {
-            var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
-            throw new InvalidOperationException($"failed to resolve GitHub user: {detail.Trim()}");
-        }
-
-        _currentUserLogin = result.StandardOutput.Trim();
-        if (string.IsNullOrWhiteSpace(_currentUserLogin))
-        {
-            throw new InvalidOperationException("failed to resolve GitHub user: gh returned an empty login");
-        }
-
+        _currentUserLogin = await GitHubApiClient.Shared.GetCurrentUserLoginAsync(cancellationToken);
         _currentUserLoginResolved = true;
         return _currentUserLogin;
     }
@@ -2031,6 +2947,10 @@ internal sealed class GhClient
         var author = node.GetProperty("author").GetProperty("login").GetString() ?? "unknown";
         var createdAt = DateTimeOffset.Parse(
             node.GetProperty("createdAt").GetString() ?? "",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal);
+        var updatedAt = DateTimeOffset.Parse(
+            node.GetProperty("updatedAt").GetString() ?? "",
             CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal);
         var approvers = node
@@ -2056,8 +2976,12 @@ internal sealed class GhClient
             author,
             node.GetProperty("url").GetString() ?? "",
             createdAt,
+            updatedAt,
             approvers,
-            priority);
+            priority,
+            node.TryGetProperty("authorAssociation", out var authorAssociation)
+                ? authorAssociation.GetString() ?? "NONE"
+                : "NONE");
     }
 
     private static PullRequestPriority CalculatePriority(
@@ -2073,7 +2997,7 @@ internal sealed class GhClient
             createdAt,
             author,
             currentUserLogin,
-            CommentAuthors(node),
+            CommentAuthors(node).Concat(ApprovalAuthors(node)),
             ReviewAuthors(node),
             reviewRequestedFromUser,
             now);
@@ -2134,6 +3058,41 @@ internal sealed class GhClient
         }
     }
 
+    private static IEnumerable<string> ApprovalAuthors(JsonElement node)
+    {
+        if (node.TryGetProperty("latestOpinionatedReviews", out var latestOpinionatedReviews)
+            && latestOpinionatedReviews.TryGetProperty("nodes", out var latestReviewNodes))
+        {
+            foreach (var review in latestReviewNodes.EnumerateArray())
+            {
+                if (IsApprovedReview(review) && TryGetLogin(review, out var login))
+                {
+                    yield return login;
+                }
+            }
+        }
+
+        if (!node.TryGetProperty("reviews", out var reviews)
+            || !reviews.TryGetProperty("nodes", out var reviewNodes))
+        {
+            yield break;
+        }
+
+        foreach (var review in reviewNodes.EnumerateArray())
+        {
+            if (IsApprovedReview(review) && TryGetLogin(review, out var login))
+            {
+                yield return login;
+            }
+        }
+    }
+
+    private static bool IsApprovedReview(JsonElement review)
+    {
+        return review.TryGetProperty("state", out var state)
+            && string.Equals(state.GetString(), "APPROVED", StringComparison.Ordinal);
+    }
+
     private static IEnumerable<string> ReviewRequestedUsers(JsonElement node)
     {
         if (!node.TryGetProperty("reviewRequests", out var reviewRequests)
@@ -2188,52 +3147,35 @@ internal sealed class GhClient
         string? cursor,
         CancellationToken cancellationToken)
     {
-        var args = new List<string>
+        return await RunGraphQlSearchPageAsync(GraphQlQuery, searchText, cursor, cancellationToken);
+    }
+
+    private static async Task<JsonDocument> RunGraphQlSearchPageAsync(
+        string query,
+        string searchText,
+        string? cursor,
+        CancellationToken cancellationToken,
+        params (string Name, string Value)[] variables)
+    {
+        var variableValues = new Dictionary<string, object?>
         {
-            "api",
-            "graphql",
-            "-f",
-            $"query={GraphQlQuery}",
-            "-F",
-            $"searchText={searchText}",
+            ["searchText"] = searchText,
+            ["after"] = string.IsNullOrWhiteSpace(cursor) ? null : cursor,
         };
 
-        if (!string.IsNullOrWhiteSpace(cursor))
+        foreach (var variable in variables)
         {
-            args.Add("-F");
-            args.Add($"after={cursor}");
+            variableValues[variable.Name] = variable.Value;
         }
 
-        return await RunGraphQlAsync(args, cancellationToken);
+        return await GitHubApiClient.Shared.GraphQlAsync(query, variableValues, cancellationToken);
     }
 
     private static async Task<JsonDocument> RunGraphQlQueryAsync(
         string query,
         CancellationToken cancellationToken)
     {
-        var args = new List<string>
-        {
-            "api",
-            "graphql",
-            "-f",
-            $"query={query}",
-        };
-
-        return await RunGraphQlAsync(args, cancellationToken);
-    }
-
-    private static async Task<JsonDocument> RunGraphQlAsync(
-        IReadOnlyList<string> args,
-        CancellationToken cancellationToken)
-    {
-        var result = await GhCommand.RunAsync(cancellationToken, GhApiTimeout, args.ToArray());
-        if (result.ExitCode != 0)
-        {
-            var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
-            throw new InvalidOperationException($"gh api failed: {detail.Trim()}");
-        }
-
-        return JsonDocument.Parse(result.StandardOutput);
+        return await GitHubApiClient.Shared.GraphQlAsync(query, variables: null, cancellationToken);
     }
 }
 
@@ -2241,22 +3183,27 @@ internal sealed class NotificationCleaner
 {
     private readonly HashSet<string> _trackedRepositories;
     private readonly IReadOnlyList<IgnoredPullRequest> _ignoredPullRequests;
+    private readonly IReadOnlyList<TopPullRequest> _topPullRequests;
 
     public NotificationCleaner(
         IReadOnlyList<RepositoryRef> trackedRepositories,
-        IReadOnlyList<IgnoredPullRequest> ignoredPullRequests)
+        IReadOnlyList<IgnoredPullRequest> ignoredPullRequests,
+        IReadOnlyList<TopPullRequest> topPullRequests)
     {
         _trackedRepositories = trackedRepositories
             .Select(repo => repo.FullName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         _ignoredPullRequests = ignoredPullRequests;
+        _topPullRequests = topPullRequests;
     }
 
     public async Task<CleanupResult> CleanupAsync(CancellationToken cancellationToken)
     {
-        if (_trackedRepositories.Count == 0 && _ignoredPullRequests.Count == 0)
+        if (_trackedRepositories.Count == 0
+            && _ignoredPullRequests.Count == 0
+            && _topPullRequests.Count == 0)
         {
-            return new CleanupResult(0, 0, 0, []);
+            return new CleanupResult(0, 0, 0, [], []);
         }
 
         var notifications = Array.Empty<Notification>();
@@ -2268,164 +3215,211 @@ internal sealed class NotificationCleaner
             notifications = (await GetUnreadNotificationsAsync(cancellationToken))
                 .Where(notification => _trackedRepositories.Contains(notification.RepositoryFullName))
                 .ToArray();
-
-            await Parallel.ForEachAsync(
-                notifications,
-                new ParallelOptions
-                {
-                    CancellationToken = cancellationToken,
-                    MaxDegreeOfParallelism = 6,
-                },
-                async (notification, token) =>
-                {
-                    var result = await HandleNotificationAsync(notification, token);
-                    if (result == CleanupAction.MarkedRead)
-                    {
-                        Interlocked.Increment(ref markedRead);
-                    }
-                    else
-                    {
-                        Interlocked.Increment(ref skipped);
-                    }
-                });
         }
 
-        var removedIgnoredPullRequests = await FindClosedIgnoredPullRequestsAsync(cancellationToken);
+        var notificationTargets = notifications
+            .Select(notification => TryCreateTarget(notification, out var target) ? target : null)
+            .Where(target => target is not null)
+            .Select(target => target!)
+            .ToArray();
+        var ignoredTargets = _ignoredPullRequests
+            .Select(pullRequest => new SubjectTarget(
+                pullRequest.Repository,
+                pullRequest.Number))
+            .ToArray();
+        var topTargets = _topPullRequests
+            .Select(pullRequest => new SubjectTarget(
+                pullRequest.Repository,
+                pullRequest.Number))
+            .ToArray();
+        var states = await GetSubjectStatesAsync(
+            notificationTargets.Concat(ignoredTargets).Concat(topTargets).ToArray(),
+            cancellationToken);
 
-        return new CleanupResult(notifications.Length, markedRead, skipped, removedIgnoredPullRequests);
+        for (var index = 0; index < notifications.Length; index++)
+        {
+            var notification = notifications[index];
+            if (!TryCreateTarget(notification, out var target))
+            {
+                skipped++;
+                continue;
+            }
+
+            var shouldMarkRead = !states.TryGetValue(target.Key, out var state)
+                || ShouldMarkRead(notification, state);
+            if (!shouldMarkRead)
+            {
+                skipped++;
+                continue;
+            }
+
+            await MarkThreadReadAsync(notification.Id, cancellationToken);
+            markedRead++;
+            if (index < notifications.Length - 1)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+            }
+        }
+
+        var removedIgnoredPullRequests = _ignoredPullRequests
+            .Where(pullRequest => states.TryGetValue(
+                    SubjectTarget.KeyFor(pullRequest.Repository, pullRequest.Number),
+                    out var state)
+                && IsClosedPullRequest(state))
+            .ToArray();
+        var removedTopPullRequests = _topPullRequests
+            .Where(pullRequest => states.TryGetValue(
+                    SubjectTarget.KeyFor(pullRequest.Repository, pullRequest.Number),
+                    out var state)
+                && IsClosedPullRequest(state))
+            .ToArray();
+
+        return new CleanupResult(
+            notifications.Length,
+            markedRead,
+            skipped,
+            removedIgnoredPullRequests,
+            removedTopPullRequests);
+    }
+
+    private static bool IsClosedPullRequest(SubjectState state)
+    {
+        return state.IsPullRequest && (state.IsClosed || state.IsMerged);
     }
 
     private static async Task<IReadOnlyList<Notification>> GetUnreadNotificationsAsync(CancellationToken cancellationToken)
     {
-        const string jqFilter = ".[] | select(.unread == true) | [.id, .subject.url, .subject.type, .repository.full_name] | @tsv";
-        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromMinutes(3), "api", "/notifications", "--paginate", "--jq", jqFilter);
-
-        if (result.ExitCode != 0)
-        {
-            var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
-            throw new InvalidOperationException($"failed to fetch notifications: {detail.Trim()}");
-        }
-
         var notifications = new List<Notification>();
-        var lines = result.StandardOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var line in lines)
+        var items = await GitHubApiClient.Shared.GetPagedArrayAsync("notifications", cancellationToken);
+        foreach (var item in items)
         {
-            var parts = line.Split('\t');
-            if (parts.Length < 4)
+            if (!item.TryGetProperty("unread", out var unread)
+                || !unread.GetBoolean()
+                || !item.TryGetProperty("subject", out var subject)
+                || !item.TryGetProperty("repository", out var repository))
             {
                 continue;
             }
 
-            notifications.Add(new Notification(parts[0], parts[1], parts[2], parts[3]));
+            var id = GetString(item, "id");
+            var subjectUrl = GetString(subject, "url");
+            var subjectType = GetString(subject, "type");
+            var repositoryFullName = GetString(repository, "full_name");
+            if (id.Length > 0 && subjectUrl.Length > 0 && repositoryFullName.Length > 0)
+            {
+                notifications.Add(new Notification(id, subjectUrl, subjectType, repositoryFullName));
+            }
         }
 
         return notifications;
     }
 
-    private static async Task<CleanupAction> HandleNotificationAsync(Notification notification, CancellationToken cancellationToken)
+    private static async Task MarkThreadReadAsync(string threadId, CancellationToken cancellationToken)
+    {
+        await GitHubApiClient.Shared.PatchAsync($"notifications/threads/{threadId}", cancellationToken);
+    }
+
+    private static async Task<IReadOnlyDictionary<string, SubjectState>> GetSubjectStatesAsync(
+        IReadOnlyList<SubjectTarget> targets,
+        CancellationToken cancellationToken)
+    {
+        var states = new Dictionary<string, SubjectState>(StringComparer.OrdinalIgnoreCase);
+        foreach (var chunk in targets
+            .DistinctBy(target => target.Key, StringComparer.OrdinalIgnoreCase)
+            .Chunk(50))
+        {
+            using var document = await GitHubApiClient.Shared.GraphQlAsync(
+                BuildSubjectStatesQuery(chunk),
+                variables: null,
+                cancellationToken);
+            var data = document.RootElement.GetProperty("data");
+            for (var index = 0; index < chunk.Length; index++)
+            {
+                var alias = $"target{index.ToString(CultureInfo.InvariantCulture)}";
+                if (!data.TryGetProperty(alias, out var repository)
+                    || repository.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+                    || !repository.TryGetProperty("issueOrPullRequest", out var subject)
+                    || subject.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                {
+                    continue;
+                }
+
+                var typeName = GetString(subject, "__typename");
+                var state = GetString(subject, "state");
+                states[chunk[index].Key] = new SubjectState(
+                    IsPullRequest: string.Equals(typeName, "PullRequest", StringComparison.Ordinal),
+                    IsClosed: string.Equals(state, "CLOSED", StringComparison.Ordinal)
+                        || string.Equals(state, "MERGED", StringComparison.Ordinal),
+                    IsMerged: string.Equals(state, "MERGED", StringComparison.Ordinal)
+                        || GetBool(subject, "merged"),
+                    IsDraft: GetBool(subject, "isDraft"));
+            }
+        }
+
+        return states;
+    }
+
+    private static string BuildSubjectStatesQuery(IReadOnlyList<SubjectTarget> targets)
+    {
+        var builder = new StringBuilder("query {\n");
+        for (var index = 0; index < targets.Count; index++)
+        {
+            var target = targets[index];
+            builder
+                .Append("  target")
+                .Append(index.ToString(CultureInfo.InvariantCulture))
+                .Append(": repository(owner: ")
+                .Append(JsonSerializer.Serialize(target.Repository.Owner))
+                .Append(", name: ")
+                .Append(JsonSerializer.Serialize(target.Repository.Name))
+                .AppendLine(") {");
+            builder
+                .Append("    issueOrPullRequest(number: ")
+                .Append(target.Number.ToString(CultureInfo.InvariantCulture))
+                .AppendLine(") {");
+            builder.AppendLine("      __typename");
+            builder.AppendLine("      ... on Issue { state }");
+            builder.AppendLine("      ... on PullRequest { state isDraft merged }");
+            builder.AppendLine("    }");
+            builder.AppendLine("  }");
+        }
+
+        builder.AppendLine("}");
+        return builder.ToString();
+    }
+
+    private static bool TryCreateTarget(Notification notification, out SubjectTarget target)
+    {
+        target = default!;
+        if ((!string.Equals(notification.SubjectType, "PullRequest", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(notification.SubjectType, "Issue", StringComparison.OrdinalIgnoreCase))
+            || !RepositoryRef.TryParse(notification.RepositoryFullName, out var repository)
+            || !Uri.TryCreate(notification.SubjectUrl, UriKind.Absolute, out var subjectUri))
+        {
+            return false;
+        }
+
+        var segment = subjectUri.Segments.LastOrDefault()?.Trim('/');
+        if (!int.TryParse(segment, NumberStyles.None, CultureInfo.InvariantCulture, out var number)
+            || number <= 0)
+        {
+            return false;
+        }
+
+        target = new SubjectTarget(repository, number);
+        return true;
+    }
+
+    private static bool ShouldMarkRead(Notification notification, SubjectState state)
     {
         if (string.Equals(notification.SubjectType, "PullRequest", StringComparison.OrdinalIgnoreCase))
         {
-            return await HandlePullRequestAsync(notification, cancellationToken);
+            return state.IsPullRequest && (state.IsClosed || state.IsMerged || state.IsDraft);
         }
 
-        if (string.Equals(notification.SubjectType, "Issue", StringComparison.OrdinalIgnoreCase))
-        {
-            return await HandleIssueAsync(notification, cancellationToken);
-        }
-
-        return CleanupAction.Skipped;
-    }
-
-    private static async Task<CleanupAction> HandlePullRequestAsync(Notification notification, CancellationToken cancellationToken)
-    {
-        var prResult = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(30), "api", notification.SubjectUrl);
-
-        if (prResult.ExitCode == 0)
-        {
-            using var doc = JsonDocument.Parse(prResult.StandardOutput);
-            var state = GetString(doc.RootElement, "state");
-            var merged = GetBool(doc.RootElement, "merged");
-            var draft = GetBool(doc.RootElement, "draft");
-
-            if (string.Equals(state, "closed", StringComparison.OrdinalIgnoreCase) || merged || draft)
-            {
-                await MarkThreadReadAsync(notification.Id, cancellationToken);
-                return CleanupAction.MarkedRead;
-            }
-
-            return CleanupAction.Skipped;
-        }
-
-        await MarkThreadReadAsync(notification.Id, cancellationToken);
-        return CleanupAction.MarkedRead;
-    }
-
-    private static async Task<CleanupAction> HandleIssueAsync(Notification notification, CancellationToken cancellationToken)
-    {
-        var issueResult = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(30), "api", notification.SubjectUrl);
-
-        if (issueResult.ExitCode == 0)
-        {
-            using var doc = JsonDocument.Parse(issueResult.StandardOutput);
-            var state = GetString(doc.RootElement, "state");
-
-            if (string.Equals(state, "closed", StringComparison.OrdinalIgnoreCase))
-            {
-                await MarkThreadReadAsync(notification.Id, cancellationToken);
-                return CleanupAction.MarkedRead;
-            }
-
-            return CleanupAction.Skipped;
-        }
-
-        await MarkThreadReadAsync(notification.Id, cancellationToken);
-        return CleanupAction.MarkedRead;
-    }
-
-    private static async Task MarkThreadReadAsync(string threadId, CancellationToken cancellationToken)
-    {
-        var result = await GhCommand.RunAsync(cancellationToken, TimeSpan.FromSeconds(30), "api", "--method", "PATCH", $"/notifications/threads/{threadId}");
-        if (result.ExitCode != 0)
-        {
-            var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
-            throw new InvalidOperationException($"failed to mark notification thread {threadId} as read: {detail.Trim()}");
-        }
-    }
-
-    private async Task<IReadOnlyList<IgnoredPullRequest>> FindClosedIgnoredPullRequestsAsync(CancellationToken cancellationToken)
-    {
-        if (_ignoredPullRequests.Count == 0)
-        {
-            return [];
-        }
-
-        var closedPullRequests = new List<IgnoredPullRequest>();
-
-        foreach (var pullRequest in _ignoredPullRequests)
-        {
-            var result = await GhCommand.RunAsync(
-                cancellationToken,
-                TimeSpan.FromSeconds(30),
-                "api",
-                $"repos/{pullRequest.Repository.FullName}/pulls/{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}");
-
-            if (result.ExitCode != 0)
-            {
-                continue;
-            }
-
-            using var doc = JsonDocument.Parse(result.StandardOutput);
-            var state = GetString(doc.RootElement, "state");
-            var merged = GetBool(doc.RootElement, "merged");
-            if (string.Equals(state, "closed", StringComparison.OrdinalIgnoreCase) || merged)
-            {
-                closedPullRequests.Add(pullRequest);
-            }
-        }
-
-        return closedPullRequests;
+        return string.Equals(notification.SubjectType, "Issue", StringComparison.OrdinalIgnoreCase)
+            && !state.IsPullRequest
+            && state.IsClosed;
     }
 
     private static string GetString(JsonElement element, string propertyName)
@@ -2450,6 +3444,18 @@ internal sealed class NotificationCleaner
                 && bool.TryParse(property.GetString(), out var parsed)
                 && parsed);
     }
+
+    private sealed record SubjectTarget(RepositoryRef Repository, int Number)
+    {
+        public string Key => KeyFor(Repository, Number);
+
+        public static string KeyFor(RepositoryRef repository, int number)
+        {
+            return $"{repository.FullName}#{number.ToString(CultureInfo.InvariantCulture)}";
+        }
+    }
+
+    private sealed record SubjectState(bool IsPullRequest, bool IsClosed, bool IsMerged, bool IsDraft);
 }
 
 internal static class PullRequests
@@ -2645,20 +3651,27 @@ internal sealed class AppSettings
 {
     private const int DefaultRequiredApprovals = 2;
     private readonly List<RepositoryRef> _repositories;
+    private readonly List<TopPullRequest> _topPullRequests;
     private readonly List<IgnoredPullRequest> _ignoredPullRequests;
 
     private AppSettings(
         string settingsPath,
         int requiredApprovals,
         IEnumerable<RepositoryRef> repositories,
+        IEnumerable<TopPullRequest> topPullRequests,
         IEnumerable<IgnoredPullRequest> ignoredPullRequests,
-        PrioritySettings priority)
+        PrioritySettings priority,
+        CodexReviewSettings codexReview)
     {
         SettingsPath = settingsPath;
         RequiredApprovals = Math.Max(1, requiredApprovals);
         Priority = priority;
+        CodexReview = codexReview;
         _repositories = repositories
             .DistinctBy(repo => repo.FullName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _topPullRequests = topPullRequests
+            .DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase)
             .ToList();
         _ignoredPullRequests = ignoredPullRequests
             .DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase)
@@ -2671,9 +3684,17 @@ internal sealed class AppSettings
 
     public PrioritySettings Priority { get; private set; }
 
+    public CodexReviewSettings CodexReview { get; private set; }
+
     public IReadOnlyList<RepositoryRef> Repositories => _repositories;
 
+    public IReadOnlyList<TopPullRequest> TopPullRequests => _topPullRequests;
+
     public IReadOnlyList<IgnoredPullRequest> IgnoredPullRequests => _ignoredPullRequests;
+
+    public HashSet<string> TopPullRequestKeys => _topPullRequests
+        .Select(pr => pr.Key)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     public HashSet<string> IgnoredPullRequestKeys => _ignoredPullRequests
         .Select(pr => pr.Key)
@@ -2681,20 +3702,37 @@ internal sealed class AppSettings
 
     public static AppSettings Load()
     {
-        var settingsPath = GetSettingsPath();
+        return Load(GetSettingsPath());
+    }
+
+    internal static AppSettings Load(string settingsPath)
+    {
+        settingsPath = Path.GetFullPath(settingsPath);
         if (!File.Exists(settingsPath))
         {
-            return new AppSettings(settingsPath, DefaultRequiredApprovals, [], [], PrioritySettings.Default);
+            return new AppSettings(
+                settingsPath,
+                DefaultRequiredApprovals,
+                [],
+                [],
+                [],
+                PrioritySettings.Default,
+                CodexReviewSettings.Default);
         }
 
         var repositories = new List<RepositoryRef>();
+        var topPullRequests = new List<TopPullRequest>();
         var ignoredPullRequests = new List<IgnoredPullRequest>();
         var requiredApprovals = DefaultRequiredApprovals;
         var priority = PrioritySettings.Default.ToBuilder();
+        var codexReview = CodexReviewSettings.Default.ToBuilder();
         var activeList = SettingsList.None;
+        var activeSection = SettingsSection.None;
 
-        foreach (var rawLine in File.ReadLines(settingsPath))
+        var lines = File.ReadAllLines(settingsPath);
+        for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
         {
+            var rawLine = lines[lineIndex];
             var line = StripComment(rawLine).Trim();
             if (line.Length == 0)
             {
@@ -2705,6 +3743,7 @@ internal sealed class AppSettings
                 || line.Equals("repos:", StringComparison.OrdinalIgnoreCase))
             {
                 activeList = SettingsList.Repositories;
+                activeSection = SettingsSection.None;
                 continue;
             }
 
@@ -2713,12 +3752,23 @@ internal sealed class AppSettings
                 || line.Equals("ignored:", StringComparison.OrdinalIgnoreCase))
             {
                 activeList = SettingsList.IgnoredPullRequests;
+                activeSection = SettingsSection.None;
+                continue;
+            }
+
+            if (line.Equals("topPullRequests:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("topPrs:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("top:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.TopPullRequests;
+                activeSection = SettingsSection.None;
                 continue;
             }
 
             if (line.StartsWith("requiredApprovals:", StringComparison.OrdinalIgnoreCase))
             {
                 activeList = SettingsList.None;
+                activeSection = SettingsSection.None;
                 var value = Unquote(line["requiredApprovals:".Length..].Trim());
                 if (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
                 {
@@ -2732,18 +3782,59 @@ internal sealed class AppSettings
                 || line.Equals("priorityScoring:", StringComparison.OrdinalIgnoreCase))
             {
                 activeList = SettingsList.None;
+                activeSection = SettingsSection.Priority;
                 continue;
             }
 
-            if (line.Equals("ignoredCommentAuthors:", StringComparison.OrdinalIgnoreCase)
+            if (line.Equals("codexReview:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("codexReviewer:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.None;
+                activeSection = SettingsSection.CodexReview;
+                continue;
+            }
+
+            if (activeSection == SettingsSection.Priority
+                && (line.Equals("ignoredCommentAuthors:", StringComparison.OrdinalIgnoreCase)
                 || line.Equals("ignoredCommentAuthorPatterns:", StringComparison.OrdinalIgnoreCase)
-                || line.Equals("ignoredAuthors:", StringComparison.OrdinalIgnoreCase))
+                || line.Equals("ignoredAuthors:", StringComparison.OrdinalIgnoreCase)))
             {
                 activeList = SettingsList.PriorityIgnoredCommentAuthors;
+                priority.IgnoredCommentAuthorPatterns.Clear();
                 continue;
             }
 
-            if (PrioritySettings.TryApply(priority, line))
+            if (activeSection == SettingsSection.CodexReview
+                && (line.Equals("ignoredAuthorPatterns:", StringComparison.OrdinalIgnoreCase)
+                    || line.Equals("ignoredAuthors:", StringComparison.OrdinalIgnoreCase)))
+            {
+                activeList = SettingsList.CodexReviewIgnoredAuthors;
+                codexReview.IgnoredAuthorPatterns.Clear();
+                continue;
+            }
+
+            if (activeSection == SettingsSection.CodexReview
+                && (line.Equals("contexts:", StringComparison.OrdinalIgnoreCase)
+                    || line.Equals("repositoryContexts:", StringComparison.OrdinalIgnoreCase)))
+            {
+                activeList = SettingsList.None;
+                ReadCodexReviewContexts(
+                    lines,
+                    ref lineIndex,
+                    GetIndentation(rawLine),
+                    codexReview.Contexts);
+                continue;
+            }
+
+            if (activeSection == SettingsSection.CodexReview
+                && CodexReviewSettings.TryApply(codexReview, line))
+            {
+                activeList = SettingsList.None;
+                continue;
+            }
+
+            if (activeSection == SettingsSection.Priority
+                && PrioritySettings.TryApply(priority, line))
             {
                 activeList = SettingsList.None;
                 continue;
@@ -2756,6 +3847,10 @@ internal sealed class AppSettings
                 {
                     repositories.Add(repository);
                 }
+                else if (activeList == SettingsList.TopPullRequests && TopPullRequest.TryParse(value, out var topPullRequest))
+                {
+                    topPullRequests.Add(topPullRequest);
+                }
                 else if (activeList == SettingsList.IgnoredPullRequests && IgnoredPullRequest.TryParse(value, out var ignoredPullRequest))
                 {
                     ignoredPullRequests.Add(ignoredPullRequest);
@@ -2764,10 +3859,21 @@ internal sealed class AppSettings
                 {
                     priority.IgnoredCommentAuthorPatterns.Add(value);
                 }
+                else if (activeList == SettingsList.CodexReviewIgnoredAuthors && value.Length > 0)
+                {
+                    codexReview.IgnoredAuthorPatterns.Add(value);
+                }
             }
         }
 
-        return new AppSettings(settingsPath, requiredApprovals, repositories, ignoredPullRequests, priority.Build());
+        return new AppSettings(
+            settingsPath,
+            requiredApprovals,
+            repositories,
+            topPullRequests,
+            ignoredPullRequests,
+            priority.Build(),
+            codexReview.Build());
     }
 
     public SettingsUpdateResult AddRepositories(IReadOnlyList<RepositoryRef> repositories)
@@ -2801,6 +3907,32 @@ internal sealed class AppSettings
         return true;
     }
 
+    public bool AddTopPullRequest(TopPullRequest pullRequest)
+    {
+        if (_topPullRequests.Any(existing => string.Equals(existing.Key, pullRequest.Key, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        _topPullRequests.Insert(0, pullRequest);
+        return true;
+    }
+
+    public bool RemoveTopPullRequests(IReadOnlyList<TopPullRequest> pullRequests)
+    {
+        if (pullRequests.Count == 0)
+        {
+            return false;
+        }
+
+        var keysToRemove = pullRequests
+            .Select(pr => pr.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var oldCount = _topPullRequests.Count;
+        _topPullRequests.RemoveAll(pr => keysToRemove.Contains(pr.Key));
+        return _topPullRequests.Count != oldCount;
+    }
+
     public bool RemoveIgnoredPullRequests(IReadOnlyList<IgnoredPullRequest> pullRequests)
     {
         if (pullRequests.Count == 0)
@@ -2832,6 +3964,23 @@ internal sealed class AppSettings
         return true;
     }
 
+    public bool ReplaceTopPullRequests(IReadOnlyList<TopPullRequest> pullRequests)
+    {
+        var replacement = pullRequests
+            .DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var currentKeys = _topPullRequests.Select(pr => pr.Key);
+        var replacementKeys = replacement.Select(pr => pr.Key);
+        if (currentKeys.SequenceEqual(replacementKeys, StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        _topPullRequests.Clear();
+        _topPullRequests.AddRange(replacement);
+        return true;
+    }
+
     public bool ReplacePriority(PrioritySettings priority)
     {
         if (Priority.SemanticallyEquals(priority))
@@ -2840,6 +3989,39 @@ internal sealed class AppSettings
         }
 
         Priority = priority;
+        return true;
+    }
+
+    public bool ReplaceCodexReview(CodexReviewSettings codexReview)
+    {
+        if (CodexReview.SemanticallyEquals(codexReview))
+        {
+            return false;
+        }
+
+        CodexReview = codexReview;
+        return true;
+    }
+
+    public bool SetCodexReviewEnabled(bool enabled)
+    {
+        if (CodexReview.Enabled == enabled)
+        {
+            return false;
+        }
+
+        CodexReview = CodexReview with { Enabled = enabled };
+        return true;
+    }
+
+    public bool SetCodexReviewAutoSubmit(bool autoSubmit)
+    {
+        if (CodexReview.AutoSubmit == autoSubmit)
+        {
+            return false;
+        }
+
+        CodexReview = CodexReview with { AutoSubmit = autoSubmit };
         return true;
     }
 
@@ -2859,6 +4041,12 @@ internal sealed class AppSettings
         foreach (var repo in _repositories.OrderBy(repo => repo.FullName, StringComparer.OrdinalIgnoreCase))
         {
             builder.AppendLine($"  - {repo.Url}");
+        }
+
+        builder.AppendLine("topPullRequests:");
+        foreach (var pr in _topPullRequests)
+        {
+            builder.AppendLine($"  - {pr.Url}");
         }
 
         builder.AppendLine("ignoredPullRequests:");
@@ -2887,7 +4075,221 @@ internal sealed class AppSettings
             builder.AppendLine($"    - {pattern}");
         }
 
+        builder.AppendLine("codexReview:");
+        builder.AppendLine($"  enabled: {CodexReview.Enabled.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  pollIntervalSeconds: {CodexReview.PollIntervalSeconds.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  readyDelayMinutes: {CodexReview.ReadyDelayMinutes.ToString("0.##", CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  startupScanDays: {CodexReview.StartupScanDays.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  eligibilityCheckSeconds: {CodexReview.EligibilityCheckSeconds.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  maxOpenPullRequests: {CodexReview.MaxOpenPullRequests.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  agent: {CodexReview.AgentName}");
+        if (!string.IsNullOrWhiteSpace(CodexReview.ResolvedModel))
+        {
+            builder.AppendLine($"  model: {CodexReview.ResolvedModel}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(CodexReview.Command))
+        {
+            builder.AppendLine($"  command: {CodexReview.Command}");
+        }
+
+        builder.AppendLine($"  sandbox: {CodexReview.Sandbox}");
+        builder.AppendLine($"  ephemeral: {CodexReview.Ephemeral.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  ignoreUserConfig: {CodexReview.IgnoreUserConfig.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  reasoningEffort: {CodexReview.ReasoningEffort}");
+        builder.AppendLine($"  maxFindings: {CodexReview.MaxFindings.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  skipWhenApprovalCountAtLeast: {CodexReview.SkipWhenApprovalCountAtLeast.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  skipWhenUniqueCommentersAtLeast: {CodexReview.SkipWhenUniqueCommentersAtLeast.ToString(CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  skipOwnPullRequests: {CodexReview.SkipOwnPullRequests.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  timeoutMinutes: {CodexReview.TimeoutMinutes.ToString("0.##", CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  failureRetryMinutes: {CodexReview.FailureRetryMinutes.ToString("0.##", CultureInfo.InvariantCulture)}");
+        builder.AppendLine($"  postNoFindingsComment: {CodexReview.PostNoFindingsComment.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  autoSubmit: {CodexReview.AutoSubmit.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  processExistingOnFirstRun: {CodexReview.ProcessExistingOnFirstRun.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  dryRun: {CodexReview.DryRun.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"  dataDirectory: {CodexReview.DataDirectory}");
+        if (!string.IsNullOrWhiteSpace(CodexReview.WorkspaceDirectory))
+        {
+            builder.AppendLine($"  workspaceDirectory: {CodexReview.WorkspaceDirectory}");
+        }
+
+        builder.AppendLine($"  contextDirectory: {CodexReview.ContextDirectory}");
+        builder.AppendLine("  contexts:");
+        foreach (var context in CodexReview.Contexts.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            builder.AppendLine($"    {JsonSerializer.Serialize(context.Key)}: |-");
+            foreach (var contextLine in NormalizeLineEndings(context.Value).Split('\n'))
+            {
+                builder.Append("      ");
+                builder.AppendLine(contextLine);
+            }
+        }
+
+        builder.AppendLine("  ignoredAuthorPatterns:");
+        foreach (var pattern in CodexReview.IgnoredAuthorPatterns)
+        {
+            builder.AppendLine($"    - {pattern}");
+        }
+
         File.WriteAllText(SettingsPath, builder.ToString(), Encoding.UTF8);
+    }
+
+    private static void ReadCodexReviewContexts(
+        IReadOnlyList<string> lines,
+        ref int lineIndex,
+        int contextsIndent,
+        IDictionary<string, string> contexts)
+    {
+        contexts.Clear();
+        var index = lineIndex + 1;
+        while (index < lines.Count)
+        {
+            var rawHeader = lines[index];
+            if (string.IsNullOrWhiteSpace(rawHeader))
+            {
+                index++;
+                continue;
+            }
+
+            var headerIndent = GetIndentation(rawHeader);
+            if (headerIndent <= contextsIndent)
+            {
+                break;
+            }
+
+            var header = StripComment(rawHeader).Trim();
+            if (header.Length == 0 || !TryParseLiteralBlockHeader(header, out var key))
+            {
+                index++;
+                continue;
+            }
+
+            index++;
+            var rawContent = new List<string>();
+            while (index < lines.Count)
+            {
+                var contentLine = lines[index];
+                if (string.IsNullOrWhiteSpace(contentLine))
+                {
+                    rawContent.Add(string.Empty);
+                    index++;
+                    continue;
+                }
+
+                if (GetIndentation(contentLine) <= headerIndent)
+                {
+                    break;
+                }
+
+                rawContent.Add(contentLine);
+                index++;
+            }
+
+            var contentIndent = rawContent
+                .Where(contentLine => contentLine.Length > 0)
+                .Select(GetIndentation)
+                .DefaultIfEmpty(headerIndent + 2)
+                .Min();
+            var context = string.Join(
+                    "\n",
+                    rawContent.Select(contentLine => contentLine.Length >= contentIndent
+                        ? contentLine[contentIndent..]
+                        : string.Empty))
+                .TrimEnd('\n');
+            if (key.Length > 0 && !string.IsNullOrWhiteSpace(context))
+            {
+                contexts[key] = context;
+            }
+        }
+
+        lineIndex = index - 1;
+    }
+
+    private static bool TryParseLiteralBlockHeader(string line, out string key)
+    {
+        key = string.Empty;
+        var separator = FindYamlSeparator(line);
+        if (separator <= 0)
+        {
+            return false;
+        }
+
+        var marker = line[(separator + 1)..].Trim();
+        if (marker is not ("|" or "|-" or "|+"))
+        {
+            return false;
+        }
+
+        key = ParseYamlKey(line[..separator].Trim());
+        return key.Length > 0;
+    }
+
+    private static int FindYamlSeparator(string value)
+    {
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character == '\\' && inDoubleQuote)
+            {
+                index++;
+                continue;
+            }
+
+            if (character == '\'' && !inDoubleQuote)
+            {
+                inSingleQuote = !inSingleQuote;
+            }
+            else if (character == '"' && !inSingleQuote)
+            {
+                inDoubleQuote = !inDoubleQuote;
+            }
+            else if (character == ':' && !inSingleQuote && !inDoubleQuote)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static string ParseYamlKey(string value)
+    {
+        if (value.Length >= 2 && value[0] == '"' && value[^1] == '"')
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<string>(value) ?? string.Empty;
+            }
+            catch (JsonException)
+            {
+                return string.Empty;
+            }
+        }
+
+        return value.Length >= 2 && value[0] == '\'' && value[^1] == '\''
+            ? value[1..^1].Replace("''", "'", StringComparison.Ordinal)
+            : value;
+    }
+
+    private static int GetIndentation(string line)
+    {
+        var indentation = 0;
+        while (indentation < line.Length && line[indentation] is ' ' or '\t')
+        {
+            indentation++;
+        }
+
+        return indentation;
+    }
+
+    private static string NormalizeLineEndings(string value)
+    {
+        return value
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .TrimEnd('\n');
     }
 
     private static string GetSettingsPath()
@@ -2940,8 +4342,17 @@ internal enum SettingsList
 {
     None,
     Repositories,
+    TopPullRequests,
     IgnoredPullRequests,
     PriorityIgnoredCommentAuthors,
+    CodexReviewIgnoredAuthors,
+}
+
+internal enum SettingsSection
+{
+    None,
+    Priority,
+    CodexReview,
 }
 
 internal sealed record PrioritySettings(
@@ -2974,7 +4385,7 @@ internal sealed record PrioritySettings(
         NoReviewsNoCommentsPoints: 10,
         TwentyDaysPoints: 35,
         LessThanThreeHoursNoCommentsPoints: -30,
-        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "copilot"]);
+        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "kimi", "copilot"]);
 
     public PrioritySettingsBuilder ToBuilder()
     {
@@ -3100,17 +4511,17 @@ internal sealed record PrioritySettings(
         var score = 0;
         var rules = new List<PriorityRuleScore>
         {
-            new("No human comments", NoCommentsPoints, commentCount == 0),
-            new("One human commenter", OneCommenterPoints, commentCount == 1),
-            new("Two or more human commenters", TwoOrMoreCommentersPoints, commentCount >= 2),
+            new("No human comments or approvals", NoCommentsPoints, commentCount == 0),
+            new("One human commenter or approver", OneCommenterPoints, commentCount == 1),
+            new("Two or more human commenters/approvers", TwoOrMoreCommentersPoints, commentCount >= 2),
             new("10+ days old and no reviews", TenDaysNoReviewsPoints, age.TotalDays >= 10 && reviewCount == 0),
             new("10+ days old and one reviewer", TenDaysOneReviewPoints, age.TotalDays >= 10 && reviewCount == 1),
             new("Review requested from you", ReviewRequestedFromUserPoints, reviewRequestedFromUser),
             new("5+ days old and no reviews", FiveDaysNoReviewsPoints, age.TotalDays >= 5 && reviewCount == 0),
             new("5+ days old and one reviewer", FiveDaysOneReviewPoints, age.TotalDays >= 5 && reviewCount == 1),
-            new("No reviews and no human comments", NoReviewsNoCommentsPoints, reviewCount == 0 && commentCount == 0),
+            new("No reviews and no human comments/approvals", NoReviewsNoCommentsPoints, reviewCount == 0 && commentCount == 0),
             new("20+ days old", TwentyDaysPoints, age.TotalDays >= 20),
-            new("Less than 3 hours old and no comments", LessThanThreeHoursNoCommentsPoints, age.TotalHours < 3 && commentCount == 0),
+            new("Less than 3 hours old and no comments/approvals", LessThanThreeHoursNoCommentsPoints, age.TotalHours < 3 && commentCount == 0),
         };
 
         score = rules
@@ -3394,6 +4805,30 @@ internal sealed record PullRequestTarget(RepositoryRef? Repository, int Number)
     }
 }
 
+internal sealed record TopPullRequest(RepositoryRef Repository, int Number)
+{
+    public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
+
+    public string Url => Repository.GetPullRequestUrl(Number);
+
+    public static TopPullRequest From(PullRequestInfo pullRequest)
+    {
+        return new TopPullRequest(pullRequest.Repository, pullRequest.Number);
+    }
+
+    public static bool TryParse(string value, out TopPullRequest pullRequest)
+    {
+        pullRequest = default!;
+        if (!PullRequestTarget.TryParse(value, out var target) || target.Repository is null)
+        {
+            return false;
+        }
+
+        pullRequest = new TopPullRequest(target.Repository, target.Number);
+        return true;
+    }
+}
+
 internal sealed record IgnoredPullRequest(RepositoryRef Repository, int Number)
 {
     public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
@@ -3518,6 +4953,17 @@ internal sealed record FetchResult(
     string? ExcludedAuthor,
     bool IsPartial);
 
+internal sealed record WeeklyStats(
+    string UserLogin,
+    DateTimeOffset WeekStartLocal,
+    DateTimeOffset WeekEndLocal,
+    int TrackedRepositoryCount,
+    int CreatedPullRequestCount,
+    int ReviewCount,
+    int ApiCalls);
+
+internal readonly record struct WeeklyCount(int Count, int ApiCalls);
+
 internal sealed record PullRequestInfo(
     string NodeId,
     RepositoryRef Repository,
@@ -3526,17 +4972,24 @@ internal sealed record PullRequestInfo(
     string Author,
     string Url,
     DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
     IReadOnlyList<string> Approvers,
-    PullRequestPriority Priority)
+    PullRequestPriority Priority,
+    string AuthorAssociation = "NONE")
 {
     public int ApprovalCount => Approvers.Count;
 
     public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
+
+    public bool IsExternalContributor => GitHubAuthorAssociation.IsExternal(AuthorAssociation);
 }
 
 internal sealed record PriorityDetail(
     string NodeId,
-    PullRequestPriority Priority);
+    DateTimeOffset UpdatedAt,
+    IReadOnlyList<string> CommentAuthors,
+    IReadOnlyList<string> ReviewAuthors,
+    IReadOnlyList<string> RequestedReviewers);
 
 internal sealed record PullRequestPriority(
     int Score,
@@ -3572,12 +5025,7 @@ internal sealed record CleanupResult(
     int Scanned,
     int MarkedRead,
     int Skipped,
-    IReadOnlyList<IgnoredPullRequest> RemovedIgnoredPullRequests);
-
-internal enum CleanupAction
-{
-    MarkedRead,
-    Skipped,
-}
+    IReadOnlyList<IgnoredPullRequest> RemovedIgnoredPullRequests,
+    IReadOnlyList<TopPullRequest> RemovedTopPullRequests);
 
 internal sealed record GhResult(int ExitCode, string StandardOutput, string StandardError);
