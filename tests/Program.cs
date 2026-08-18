@@ -44,6 +44,7 @@ await RunAsync("Claude structured review output", TestClaudeStructuredOutputAsyn
 await RunAsync("Kimi structured review output", TestKimiStructuredOutputAsync);
 await RunAsync("DeepSeek structured review output", TestDeepSeekStructuredOutputAsync);
 await RunAsync("collaborative review ledger and failure isolation", TestCollaborativeReviewPipelineAsync);
+await RunAsync("review worktree resets after every agent", TestReviewWorktreeResetAsync);
 await RunAsync("Deep Code safety settings", TestDeepCodeSafetySettingsAsync);
 await RunAsync("Deep Code hidden update prompt", TestDeepCodeHiddenUpdatePromptAsync);
 await RunAsync("startup review scan lookback", TestStartupScanLookbackAsync);
@@ -212,6 +213,7 @@ Task TestSettingsRoundTripAsync()
         Equal(20d, settings.CodexReview.ReadyDelayMinutes, "default delay");
         Equal(4, settings.CodexReview.StartupScanDays, "default startup scan");
         Equal(4, settings.CodexReview.Agents.Count, "default review pipeline size");
+        Equal("workspace-write", settings.CodexReview.Sandbox, "default review sandbox");
         var defaultCodex = settings.CodexReview.EnabledAgents.Single();
         Equal(ReviewAgent.Codex, defaultCodex.Agent, "default enabled review agent");
         Equal(CodexReviewSettings.DefaultCodexModel, defaultCodex.Model, "default Codex model");
@@ -480,7 +482,8 @@ Task TestReviewAgentInvocationAsync()
     var codex = LocalReviewAgent.CreateInvocation(codexAgent, globalSettings, paths, settingsDirectory);
     Equal("codex", codex.Command, "Codex executable");
     AssertArgumentPair(codex.Arguments, "--model", "gpt-test", "Codex model");
-    AssertArgumentPair(codex.Arguments, "--sandbox", "read-only", "Codex sandbox");
+    AssertArgumentPair(codex.Arguments, "--cd", settingsDirectory, "Codex worktree");
+    AssertArgumentPair(codex.Arguments, "--sandbox", "workspace-write", "Codex sandbox");
     Assert(codex.Arguments.Contains("--output-schema"), "Codex output schema was omitted");
 
     var defaultClaudeAgent = ReviewAgentSettings.DefaultFor(ReviewAgent.Claude) with { Model = null };
@@ -490,7 +493,9 @@ Task TestReviewAgentInvocationAsync()
     var claude = LocalReviewAgent.CreateInvocation(claudeAgent, globalSettings, paths, settingsDirectory);
     Equal("claude", claude.Command, "Claude executable");
     AssertArgumentPair(claude.Arguments, "--model", "opus", "Claude model");
-    AssertArgumentPair(claude.Arguments, "--permission-mode", "plan", "Claude permission mode");
+    AssertArgumentPair(claude.Arguments, "--permission-mode", "auto", "Claude permission mode");
+    AssertArgumentPair(claude.Arguments, "--tools", "Read,Grep,Glob,Bash,Edit,Write", "Claude local tools");
+    Assert(!claude.Arguments.Contains("--disallowedTools"), "Claude editing tools were still disabled");
     AssertArgumentPair(claude.Arguments, "--output-format", "json", "Claude output format");
     Assert(claude.Arguments.Contains("--json-schema"), "Claude JSON schema was omitted");
     Assert(claude.Arguments.Contains("--no-session-persistence"), "Claude session persistence was not disabled");
@@ -503,6 +508,7 @@ Task TestReviewAgentInvocationAsync()
     Assert(!kimi.PromptInStandardInput, "Kimi prompt was sent through stdin");
     Assert(!kimi.Arguments.Contains("--model"), "Kimi inherited the Codex default model");
     AssertArgumentPair(kimi.Arguments, "--output-format", "stream-json", "Kimi output format");
+    Assert(kimi.Arguments.Contains("--auto"), "Kimi tool approvals were not automatic");
     AssertArgumentPair(kimi.Arguments, "--agent-file", paths.KimiAgentPath, "Kimi agent profile");
     AssertArgumentPair(kimi.Arguments, "--skills-dir", paths.KimiSkillsDirectory, "Kimi skills isolation");
     AssertArgumentPair(kimi.Arguments, "--add-dir", paths.RunsDirectory, "Kimi run artifacts");
@@ -581,12 +587,31 @@ Task TestReviewCommentToneAsync()
         DateTimeOffset.UtcNow,
         new HashSet<string>(StringComparer.OrdinalIgnoreCase),
         "MEMBER");
+    var worktree = Path.Combine(Path.GetTempPath(), "owner-repo-pr-42");
     var prompt = LocalReviewAgent.BuildPrompt(
         pullRequest,
         "reviewer",
         "Repository context",
-        isManual: false);
+        isManual: false,
+        worktree: worktree);
 
+    Assert(
+        prompt.Contains(
+            $"repository worktree is `{Path.GetFullPath(worktree)}`",
+            StringComparison.Ordinal),
+        "review prompt did not identify the absolute worktree");
+    Assert(
+        prompt.Contains("process starts with that path as its working directory", StringComparison.Ordinal)
+            && prompt.Contains("tests permitted by your tool policy", StringComparison.Ordinal),
+        "review prompt did not explain where repository commands run");
+    Assert(
+        prompt.Contains("You may modify files and run local commands or tests", StringComparison.Ordinal)
+            && prompt.Contains("force-resets and cleans the worktree", StringComparison.Ordinal),
+        "review prompt did not describe disposable write and test access");
+    Assert(
+        prompt.Contains("Do not write outside the worktree", StringComparison.Ordinal)
+            && prompt.Contains("mutate Git history", StringComparison.Ordinal),
+        "review prompt did not retain the external-write and Git-mutation boundary");
     Assert(
         prompt.Contains("neutral declarative statement", StringComparison.Ordinal),
         "review prompt did not require declarative titles");
@@ -825,8 +850,10 @@ Task TestKimiStructuredOutputAsync()
         var agentPath = Path.Combine(directory, "reviewer.md");
         LocalReviewAgent.WriteKimiAgentProfile(agentPath);
         var profile = File.ReadAllText(agentPath);
-        Assert(profile.Contains("tools: Read, Grep, Glob", StringComparison.Ordinal), "Kimi profile is not read-only");
-        Assert(!profile.Contains("Bash", StringComparison.Ordinal), "Kimi profile allows shell execution");
+        Assert(
+            profile.Contains("tools: Read, Grep, Glob, Write, Edit, Bash", StringComparison.Ordinal),
+            "Kimi profile does not allow local edits and tests");
+        Assert(profile.Contains("disposable Git worktree", StringComparison.Ordinal), "Kimi reset contract is missing");
 
         var reviewJson =
             """
@@ -985,6 +1012,31 @@ async Task TestCollaborativeReviewPipelineAsync()
             Assert(ex.Message.Contains("kimi", StringComparison.Ordinal), "all-agent error omitted Kimi");
         }
 
+        var resetAttempts = 0;
+        try
+        {
+            await LocalReviewAgent.RunPipelineAsync(
+                pipeline,
+                CollaborativeReviewLedger.CreateForTest(
+                    Path.Combine(directory, "pr-reset-failure.review.jsonl"),
+                    Path.Combine(directory, "pr-reset-failure.collaboration.jsonl")),
+                maxFindings: 5,
+                (_, _) =>
+                {
+                    resetAttempts++;
+                    throw new ReviewWorktreeResetException(
+                        "worktree reset failed",
+                        new InvalidOperationException("git clean failed"));
+                },
+                agentStarted: null,
+                CancellationToken.None);
+            throw new InvalidOperationException("pipeline continued after a reset failure");
+        }
+        catch (ReviewWorktreeResetException)
+        {
+            Equal(1, resetAttempts, "agents started after a reset failure");
+        }
+
         var canceledUpdates = new List<ReviewAgentStageUpdate>();
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
@@ -1013,6 +1065,159 @@ async Task TestCollaborativeReviewPipelineAsync()
     }
 }
 
+async Task TestReviewWorktreeResetAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-reset-tests-" + Guid.NewGuid().ToString("N"));
+    var repository = Path.Combine(directory, "repository");
+    var worktreesDirectory = Path.Combine(directory, "worktrees");
+    var worktree = Path.Combine(worktreesDirectory, "owner-repo-pr-42");
+    var ledgerPath = Path.Combine(worktree, "pr-42.review.jsonl");
+    Directory.CreateDirectory(repository);
+    try
+    {
+        await GitInAsync(repository, "init");
+        await GitInAsync(repository, "config", "user.name", "Pr Tests");
+        await GitInAsync(repository, "config", "user.email", "pr-tests@example.invalid");
+        File.WriteAllText(Path.Combine(repository, ".gitignore"), "bin/\n");
+        File.WriteAllText(Path.Combine(repository, "tracked.txt"), "original\n");
+        await GitInAsync(repository, "add", ".gitignore", "tracked.txt");
+        await GitInAsync(repository, "commit", "-m", "test head");
+        var expectedHead = (await GitInAsync(repository, "rev-parse", "HEAD")).StandardOutput.Trim();
+        Directory.CreateDirectory(worktreesDirectory);
+        await GitInAsync(repository, "worktree", "add", "--detach", worktree, expectedHead);
+        Assert(File.Exists(Path.Combine(worktree, ".git")), "test fixture is not a linked Git worktree");
+        var ledger = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"review_context\"}\n");
+        File.WriteAllBytes(ledgerPath, ledger);
+
+        var value = await ReviewWorktreeReset.RunStageAsync(
+            worktree,
+            worktreesDirectory,
+            expectedHead,
+            ledgerPath,
+            "successful test agent",
+            () =>
+            {
+                DirtyWorktree("successful");
+                return Task.FromResult(42);
+            });
+        Equal(42, value, "successful stage result");
+        await AssertRestoredAsync(expectedHead, ledger);
+
+        try
+        {
+            await ReviewWorktreeReset.RunStageAsync<int>(
+                worktree,
+                worktreesDirectory,
+                expectedHead,
+                ledgerPath,
+                "failed test agent",
+                () =>
+                {
+                    DirtyWorktree("failed");
+                    throw new InvalidOperationException("simulated agent failure");
+                });
+            throw new InvalidOperationException("failed agent stage unexpectedly completed");
+        }
+        catch (InvalidOperationException ex) when (ex.Message == "simulated agent failure")
+        {
+        }
+
+        await AssertRestoredAsync(expectedHead, ledger);
+
+        try
+        {
+            await ReviewWorktreeReset.RunStageAsync(
+                worktree,
+                worktreesDirectory,
+                expectedHead,
+                ledgerPath,
+                "canceled test agent",
+                () =>
+                {
+                    DirtyWorktree("canceled");
+                    return Task.FromCanceled<int>(new CancellationToken(canceled: true));
+                });
+            throw new InvalidOperationException("canceled agent stage unexpectedly completed");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        await AssertRestoredAsync(expectedHead, ledger);
+
+        try
+        {
+            await ReviewWorktreeReset.RestoreAsync(
+                worktree,
+                Path.Combine(directory, "different-root"),
+                expectedHead,
+                ledgerPath,
+                ledger);
+            throw new InvalidOperationException("unsafe reset path was accepted");
+        }
+        catch (InvalidOperationException ex) when (ex.Message.StartsWith("Unsafe worktree path:", StringComparison.Ordinal))
+        {
+        }
+
+        void DirtyWorktree(string suffix)
+        {
+            File.WriteAllText(Path.Combine(worktree, "tracked.txt"), $"modified-{suffix}\n");
+            File.WriteAllText(Path.Combine(worktree, "untracked.txt"), suffix);
+            Directory.CreateDirectory(Path.Combine(worktree, "bin"));
+            File.WriteAllText(Path.Combine(worktree, "bin", "test-output.dll"), suffix);
+            File.WriteAllText(ledgerPath, "tampered\n");
+        }
+
+        async Task AssertRestoredAsync(string head, byte[] expectedLedger)
+        {
+            Equal("original", File.ReadAllText(Path.Combine(worktree, "tracked.txt")).Trim(), "tracked file reset");
+            Assert(!File.Exists(Path.Combine(worktree, "untracked.txt")), "untracked file survived reset");
+            Assert(!Directory.Exists(Path.Combine(worktree, "bin")), "ignored build output survived reset");
+            Assert(File.ReadAllBytes(ledgerPath).SequenceEqual(expectedLedger), "coordinator ledger was not restored");
+            Equal(
+                head,
+                (await GitAsync("rev-parse", "HEAD")).StandardOutput.Trim(),
+                "worktree head reset");
+        }
+
+        Task<ProcessResult> GitAsync(params string[] arguments) => GitInAsync(worktree, arguments);
+
+        async Task<ProcessResult> GitInAsync(string workingDirectory, params string[] arguments)
+        {
+            var gitArguments = new List<string> { "-C", workingDirectory };
+            gitArguments.AddRange(arguments);
+            var result = await ProcessRunner.RunAsync(
+                "git",
+                gitArguments,
+                workingDirectory,
+                input: null,
+                timeout: TimeSpan.FromSeconds(30),
+                eligibilityCheckInterval: null,
+                stillEligible: null,
+                CancellationToken.None);
+            if (result.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"test git {arguments[0]} failed: {result.StandardError.Trim()}");
+            }
+
+            return result;
+        }
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                File.SetAttributes(path, File.GetAttributes(path) & ~FileAttributes.ReadOnly);
+            }
+
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+}
+
 Task TestDeepCodeSafetySettingsAsync()
 {
     var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
@@ -1025,10 +1230,17 @@ Task TestDeepCodeSafetySettingsAsync()
     {
         using (DeepCodeSafetySettings.Create(directory))
         {
-            var safe = File.ReadAllText(settingsPath);
-            Assert(safe.Contains("\"read-in-cwd\"", StringComparison.Ordinal), "Deep Code repository reads were not allowed");
-            Assert(safe.Contains("\"write-in-cwd\"", StringComparison.Ordinal), "Deep Code writes were not denied");
-            Assert(safe.Contains("\"network\"", StringComparison.Ordinal), "Deep Code network access was not denied");
+            using var document = JsonDocument.Parse(File.ReadAllText(settingsPath));
+            var permissions = document.RootElement.GetProperty("permissions");
+            SetEqual(
+                ["read-in-cwd", "write-in-cwd", "delete-in-cwd", "query-git-log"],
+                permissions.GetProperty("allow").EnumerateArray().Select(value => value.GetString()!),
+                "Deep Code allowed permissions");
+            SetEqual(
+                ["read-out-cwd", "write-out-cwd", "delete-out-cwd", "mutate-git-log", "network", "mcp"],
+                permissions.GetProperty("deny").EnumerateArray().Select(value => value.GetString()!),
+                "Deep Code denied permissions");
+            Equal("askAll", permissions.GetProperty("defaultMode").GetString(), "Deep Code unknown permission mode");
         }
 
         Equal(original, File.ReadAllText(settingsPath), "Deep Code project settings were not restored");
@@ -1130,6 +1342,22 @@ Task TestReviewWorkspacePathAsync()
         Path.Combine(expectedWorkspace, "worktrees"),
         customized.WorktreesDirectory,
         "worktree root");
+    _ = CollaborativeReviewLedger.Create(
+        customized,
+        pullRequest,
+        CodexReviewSettings.Default.EnabledAgents);
+    using (var ledger = JsonDocument.Parse(File.ReadLines(customized.LedgerArtifactPath).Single()))
+    {
+        Equal(
+            customized.WorktreeDirectory,
+            ledger.RootElement.GetProperty("working_directory").GetString(),
+            "ledger working directory");
+        Equal(
+            customized.CheckoutDirectory,
+            ledger.RootElement.GetProperty("repository_cache").GetString(),
+            "ledger repository cache");
+    }
+
     if (OperatingSystem.IsWindows())
     {
         builder.WorkspaceDirectory = @"H:\reviews";
@@ -1137,6 +1365,7 @@ Task TestReviewWorkspacePathAsync()
         Equal(Path.GetFullPath(@"H:\reviews"), absolute.WorkspaceDirectory, "absolute Windows workspace root");
     }
 
+    Directory.Delete(settingsDirectory, recursive: true);
     return Task.CompletedTask;
 }
 

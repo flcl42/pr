@@ -143,7 +143,17 @@ eligible when automatic review is off and is removed after completion, closure,
 head change, account change, or explicit queue loss.
 
 Enabled agents run sequentially against one detached worktree at the exact PR
-head with read-only permissions and a validated structured-output contract. Repository context can be stored inline under
+head with permission to inspect, modify, and test code under a validated
+structured-output contract. Edits are investigative only. After every agent,
+including a failed, timed-out, or canceled agent, the coordinator force-checks
+out the original PR head, removes untracked and ignored outputs, verifies the
+worktree is clean, and restores the shared ledger before starting the next
+agent. A reset failure stops the pipeline.
+Every agent process starts in that worktree. Its absolute path and the separate
+repository-cache path are written into the prompt, agent metadata, and initial
+shared-ledger record, so repository commands and any tests allowed by the
+configured tool policy have an unambiguous working directory. Repository
+context can be stored inline under
 `codexReview.contexts` in `.pr.yml`; use the full `OWNER/REPO` slug to avoid
 collisions. Inline context takes precedence over `<repo>.md` next to the
 executable and the embedded Nethermind fallback. Every finding is validated
@@ -256,7 +266,7 @@ codexReview:
       enabled: false
       model: deepseek-v4-pro
       effort: max
-  sandbox: read-only
+  sandbox: workspace-write
   ephemeral: true
   ignoreUserConfig: true
   maxFindings: 25
@@ -311,27 +321,32 @@ accepts `enabled`, `model`, `effort`, and an optional `command` override. Omit
 single enabled pipeline entry the next time settings are saved.
 
 Codex receives `model` and `effort` through its CLI and uses the global
-`sandbox`. Claude receives both values and runs in `plan` permission mode with
-editing tools disabled. Kimi receives `model`, but its CLI does not expose an
-effort control; any configured Kimi effort is ignored. It runs with an explicit
-agent profile limited to `Read`, `Grep`, and `Glob` plus a pre-generated PR
-diff. DeepSeek runs through the `deepcode` CLI in a cross-platform pseudo
-terminal because Deep Code requires a TTY. Deep Code receives the model through
-`DEEPCODE_MODEL`; its effort may be `high` or `max` and is passed through
-`DEEPCODE_REASONING_EFFORT`. A temporary project policy allows worktree reads
-and Git inspection while denying writes, deletion, network access, MCP, and Git
-mutation. The original project policy is restored after the stage.
+`sandbox`, whose default is `workspace-write`. Claude receives both values,
+runs in `auto` permission mode, and exposes only local read, search, shell,
+edit, and write tools. Kimi receives `model`, but its CLI does not expose an
+effort control; any configured Kimi effort is ignored. It runs with `--auto`
+and an explicit profile exposing `Read`, `Grep`, `Glob`, `Write`, `Edit`, and
+`Bash`, plus a pre-generated PR diff. DeepSeek runs through the `deepcode` CLI
+in a cross-platform pseudo terminal because Deep Code requires a TTY. Deep Code
+receives the model through `DEEPCODE_MODEL`; its effort may be `high` or `max`
+and is passed through `DEEPCODE_REASONING_EFFORT`. A temporary project policy
+allows reads, writes, deletion, tests, and Git inspection inside the worktree
+while denying access outside it, network access, MCP, and Git-history mutation.
+The original project policy is restored after the stage.
 
 Each agent returns the same `summary` plus `findings` JSON object. The
 coordinator validates the schema and diff anchors, removes exact repeated
 findings, and appends accepted entries to the shared JSONL ledger.
-`timeoutMinutes` applies separately to each agent. Ephemeral sessions and ignored user
+`timeoutMinutes` applies separately to each agent. The worktree reset also runs
+after timeouts and cancellation. Ephemeral sessions and ignored user
 configuration apply where the selected CLI supports them.
 
 `workspaceDirectory` is the root for repository clones and PR worktrees. The
 directory is created when a review first needs it. It accepts an absolute path,
 a path relative to `.pr.yml`, environment variables, or a `~/` home-relative
-path. When omitted, it uses `dataDirectory` for backward compatibility.
+path. Cached clones use `<workspaceDirectory>/repositories/<owner>-<repo>`;
+agents run in `<workspaceDirectory>/worktrees/<owner>-<repo>-pr-<number>`.
+When omitted, it uses `dataDirectory` for backward compatibility.
 
 Context lookup first checks the full case-insensitive repository slug, then the
 short repository name for compatibility, then `contextDirectory`, and finally

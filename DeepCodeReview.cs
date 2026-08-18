@@ -10,12 +10,15 @@ internal sealed class DeepCodeSafetySettings : IDisposable
     private static readonly byte[] SafeSettings = Encoding.UTF8.GetBytes("""
         {
           "permissions": {
-            "allow": ["read-in-cwd", "query-git-log"],
+            "allow": [
+              "read-in-cwd",
+              "write-in-cwd",
+              "delete-in-cwd",
+              "query-git-log"
+            ],
             "deny": [
               "read-out-cwd",
-              "write-in-cwd",
               "write-out-cwd",
-              "delete-in-cwd",
               "delete-out-cwd",
               "mutate-git-log",
               "network",
