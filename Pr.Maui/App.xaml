@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Application xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="PrDesktop.App">
+    <Application.Resources>
+        <ResourceDictionary>
+            <Color x:Key="CanvasColor">#F4F5F7</Color>
+            <Color x:Key="SurfaceColor">#FFFFFF</Color>
+            <Color x:Key="BorderColor">#D5D9E0</Color>
+            <Color x:Key="TextColor">#171A1F</Color>
+            <Color x:Key="MutedColor">#66707C</Color>
+            <Color x:Key="AccentColor">#0969DA</Color>
+            <Color x:Key="AccentSoftColor">#DDF4FF</Color>
+            <Color x:Key="SuccessColor">#1A7F37</Color>
+            <Color x:Key="WarningColor">#9A6700</Color>
+            <Color x:Key="DangerColor">#CF222E</Color>
+
+            <Style TargetType="ContentPage">
+                <Setter Property="BackgroundColor" Value="{StaticResource CanvasColor}" />
+            </Style>
+            <Style TargetType="Label">
+                <Setter Property="TextColor" Value="{StaticResource TextColor}" />
+                <Setter Property="FontSize" Value="13" />
+            </Style>
+            <Style TargetType="Button">
+                <Setter Property="BackgroundColor" Value="{StaticResource SurfaceColor}" />
+                <Setter Property="BorderColor" Value="{StaticResource BorderColor}" />
+                <Setter Property="BorderWidth" Value="1" />
+                <Setter Property="CornerRadius" Value="5" />
+                <Setter Property="HeightRequest" Value="34" />
+                <Setter Property="MinimumHeightRequest" Value="34" />
+                <Setter Property="Padding" Value="12,4" />
+                <Setter Property="TextColor" Value="{StaticResource TextColor}" />
+                <Setter Property="FontSize" Value="13" />
+            </Style>
+            <Style x:Key="PrimaryButton" TargetType="Button">
+                <Setter Property="BackgroundColor" Value="{StaticResource AccentColor}" />
+                <Setter Property="BorderColor" Value="{StaticResource AccentColor}" />
+                <Setter Property="TextColor" Value="White" />
+            </Style>
+            <Style x:Key="QuietButton" TargetType="Button">
+                <Setter Property="BackgroundColor" Value="Transparent" />
+                <Setter Property="BorderWidth" Value="0" />
+                <Setter Property="Padding" Value="6,2" />
+            </Style>
+            <Style x:Key="SectionHeading" TargetType="Label">
+                <Setter Property="FontAttributes" Value="Bold" />
+                <Setter Property="FontSize" Value="14" />
+            </Style>
+            <Style x:Key="Caption" TargetType="Label">
+                <Setter Property="TextColor" Value="{StaticResource MutedColor}" />
+                <Setter Property="FontSize" Value="12" />
+            </Style>
+            <Style TargetType="Entry">
+                <Setter Property="BackgroundColor" Value="Transparent" />
+                <Setter Property="TextColor" Value="{StaticResource TextColor}" />
+                <Setter Property="PlaceholderColor" Value="#89919C" />
+                <Setter Property="FontSize" Value="13" />
+                <Setter Property="HeightRequest" Value="36" />
+            </Style>
+            <Style TargetType="Switch">
+                <Setter Property="OnColor" Value="{StaticResource AccentColor}" />
+                <Setter Property="ThumbColor" Value="White" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

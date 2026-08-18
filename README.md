@@ -1,15 +1,18 @@
 # pr
 
-Compact GitHub PR dashboard, opener, notification cleaner, and optional AI
-review watcher using Codex, Claude, or Kimi.
+Compact GitHub PR dashboard, opener, notification cleaner, and optional
+collaborative review watcher using Codex, Claude, Kimi, and DeepSeek through
+Deep Code.
 
 ## Install
 
-Release assets are unpacked, self-contained single-file executables. The app
-uses `GH_TOKEN` or `GITHUB_TOKEN` when set, otherwise it reads the active token
-from `gh auth token`, so install and authenticate GitHub CLI first with
-`gh auth login`. Automatic PR review also requires the configured `codex`,
-`claude`, or `kimi` CLI on `PATH`; the reviewer is disabled by default.
+CLI release assets are unpacked, self-contained single-file executables. The
+optional Windows desktop companion is a self-contained zip installed beside
+the CLI. The app uses `GH_TOKEN` or `GITHUB_TOKEN` when set, otherwise it reads
+the active token from `gh auth token`, so install and authenticate GitHub CLI
+first with `gh auth login`. Automatic PR review also requires each enabled
+`codex`, `claude`, `kimi`, or `deepcode` CLI on `PATH`; the reviewer is disabled
+by default.
 
 Linux, bash:
 
@@ -26,7 +29,7 @@ repo=flcl42/pr; arch="$(uname -m)"; asset=pr-macos-arm64; [ "$arch" = "x86_64" ]
 Windows, PowerShell:
 
 ```powershell
-$repo='flcl42/pr'; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/pr-windows-x64.exe" -OutFile ".\pr.exe"
+$repo='flcl42/pr'; $zip=Join-Path $env:TEMP 'pr-ui-windows-x64.zip'; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/pr-windows-x64.exe" -OutFile ".\pr.exe"; Invoke-WebRequest "https://github.com/$repo/releases/latest/download/pr-ui-windows-x64.zip" -OutFile $zip; Expand-Archive $zip ".\pr-ui" -Force; Remove-Item $zip
 ```
 
 ## Usage
@@ -38,6 +41,7 @@ pr OWNER/REPO
 pr 10843
 pr OWNER/REPO#10843
 pr https://github.com/OWNER/REPO/pull/10843
+pr ui
 pr --once
 pr --cleanup-once
 ```
@@ -46,13 +50,44 @@ Running `pr` with no arguments starts the interactive PR dashboard. Passing a
 repository URL or `OWNER/REPO` adds that repository to the tracked list and saves
 it in `.pr.yml` next to the executable.
 
-Only one interactive dashboard or maintenance command can run from a given
-executable path. Starting another one takes over the active instance. Repository
-updates and one-shot PR open commands exit independently and leave a running
-dashboard untouched.
+Only one interactive dashboard or maintenance command can run for a given
+settings file. Starting the console or desktop dashboard takes over the active
+instance that uses the same `.pr.yml`. Repository updates and one-shot PR open
+commands exit independently and leave a running dashboard untouched.
 
 If no repositories are tracked, the dashboard stays open with an empty list and
 shows the add command instead of exiting.
+
+### Desktop UI
+
+`pr ui` starts an optional Windows MAUI companion using the same `.pr.yml` as
+the CLI. It provides the grouped Reviewed, Top, and regular PR table; interactive
+search; urgency breakdowns; repository addition; refresh and notification
+cleanup; weekly stats; ignore and Top actions; manual review queueing; review
+enablement and delivery controls; and live status for every configured agent
+stage. PR titles open GitHub, while PR numbers open the urgency calculation.
+Reviewed titles start with the agents that completed successfully: `C` for
+Codex, `c` for Claude, `K` for Kimi, and `D` for DeepSeek. Failed agents are
+omitted, so `[CcK]` means those three stages completed.
+
+The default solution deliberately excludes MAUI and needs only the .NET SDK:
+
+```powershell
+dotnet build Pr.slnx -c Release
+```
+
+Build the desktop companion explicitly on Windows with the `maui-windows`
+workload. Publish it into a `pr-ui` directory beside `pr.exe`, which is one of
+the locations discovered by `pr ui`:
+
+```powershell
+dotnet workload install maui-windows
+dotnet publish Pr.Maui/Pr.Maui.csproj -c Release -r win-x64 --self-contained true -p:WindowsPackageType=None -o C:\Programs\pr-ui
+```
+
+For a development output in another location, set `PR_UI_PATH` to the full
+`pr-ui.exe` path. The launcher passes the CLI settings path through
+`PR_SETTINGS_PATH`, so the companion never creates a separate configuration.
 
 Passing a PR number opens it in the default browser. Bare PR numbers work when a
 single repository is tracked. With multiple repositories, use `OWNER/REPO#NUMBER`
@@ -74,8 +109,8 @@ Titles are terminal hyperlinks in `--once` output. In the interactive
 dashboard, click the title column to open a PR directly from the TUI.
 
 Press `V` to enable or disable automatic agent review. The setting is persisted,
-and the configured agent/model plus live reviewer state are shown in the status
-area. On startup, directly
+and the configured agent pipeline plus live reviewer state are shown in the
+status area. On startup, directly
 requested PRs created within the last four days are armed and begin the same
 20-minute timer; older existing PRs are baselined without review. After that, a
 newly discovered PR or newly added direct review request for the authenticated
@@ -107,8 +142,8 @@ automatic watcher cancels stale automatic work. A manual queue entry remains
 eligible when automatic review is off and is removed after completion, closure,
 head change, account change, or explicit queue loss.
 
-The selected agent runs against a detached worktree at the exact PR head with
-read-only permissions and a validated structured-output contract. Repository context can be stored inline under
+Enabled agents run sequentially against one detached worktree at the exact PR
+head with read-only permissions and a validated structured-output contract. Repository context can be stored inline under
 `codexReview.contexts` in `.pr.yml`; use the full `OWNER/REPO` slug to avoid
 collisions. Inline context takes precedence over `<repo>.md` next to the
 executable and the embedded Nethermind fallback. Every finding is validated
@@ -120,12 +155,18 @@ pending review from an older head must be submitted or discarded first. The
 review body is a short severity-and-files summary with no agent attribution or
 review-state text. Finding titles describe the observed problem rather than
 directing the author, and finding bodies keep remedies conditional and
-outcome-focused. A clean result creates nothing by default.
+outcome-focused. Before each stage, the agent reads `pr-<number>.review.jsonl`
+from the worktree. The coordinator appends validated findings and agent failures
+to that shared ledger, instructs later agents not to repeat the same underlying
+defect, and publishes the accumulated findings once after the pipeline finishes.
+An agent error advances to the next enabled agent; a job fails and retries only
+when every enabled agent fails. A clean result creates nothing by default.
 
 Completed agent results appear in a section above Top PRs. Each row indicates
 whether the result was sent, drafted, clean, or kept local. Clicking its title
 opens the PR, acknowledges the item, and moves it back to Top or the
-regular section. Review state and run artifacts live under `dataDirectory`.
+regular section. Review state, per-agent prompts/results/logs, and a preserved
+copy of the collaborative JSONL ledger live under `dataDirectory`.
 Cached repositories and temporary worktrees live under `workspaceDirectory`,
 which falls back to `dataDirectory` when it is omitted.
 
@@ -141,9 +182,9 @@ saved in `.pr.yml`, stay otherwise normal, and are separated from the rest by a
 single row when visible. Closed and merged entries are removed by the regular
 cleanup pass.
 
-Press `F1` to search PR titles in a filter row above the table. Filtering is
-interactive, ignored PRs are included while search is active, and `Esc` cancels
-the search.
+Press `F1` to search PR titles, numbers, or authors in a filter row above the
+table. Filtering is interactive, ignored PRs are included while search is
+active, and `Esc` cancels the search.
 
 Press `S` to open this week's tracked-repository stats for your GitHub user:
 non-draft PRs you created that are still open or merged, and review submissions
@@ -189,6 +230,8 @@ priority:
     - codex
     - claude
     - kimi
+    - deepseek
+    - deepcode
     - copilot
 codexReview:
   enabled: false
@@ -197,12 +240,25 @@ codexReview:
   startupScanDays: 4
   eligibilityCheckSeconds: 15
   maxOpenPullRequests: 1000
-  agent: codex
-  model: gpt-5.6-sol
+  agents:
+    codex:
+      enabled: true
+      model: gpt-5.6-sol
+      effort: max
+    claude:
+      enabled: false
+      model: opus
+      effort: max
+    kimi:
+      enabled: false
+      model: kimi-code/k3
+    deepseek:
+      enabled: false
+      model: deepseek-v4-pro
+      effort: max
   sandbox: read-only
   ephemeral: true
   ignoreUserConfig: true
-  reasoningEffort: max
   maxFindings: 25
   skipWhenApprovalCountAtLeast: 2
   skipWhenUniqueCommentersAtLeast: 2
@@ -226,6 +282,8 @@ codexReview:
     - codex
     - claude
     - kimi
+    - deepseek
+    - deepcode
     - copilot
 ```
 
@@ -239,23 +297,36 @@ The review watcher state is intentionally separate from `.pr.yml` so frequent
 poll updates do not rewrite user settings. `startupScanDays` controls the
 startup catch-up window and `0` disables it. `processExistingOnFirstRun: true`
 still opts into every already-requested PR after a fresh state file, regardless
-of age. `dryRun: true` runs the selected agent and keeps local results without
+of age. `dryRun: true` runs the enabled pipeline and keeps local results without
 posting to GitHub.
 
-`postNoFindingsComment: true` creates a summary-only review for a clean result;
-it follows the current `autoSubmit` delivery mode.
+`postNoFindingsComment: true` creates a summary-only review only when every
+enabled agent completed cleanly; it follows the current `autoSubmit` delivery
+mode.
 
-Set `agent` to `codex`, `claude`, or `kimi`. `model` is forwarded through the
-selected CLI's `--model` flag. Codex defaults to the pinned `gpt-5.6-sol`; an
-omitted Claude or Kimi model uses that CLI's default. Change or remove `model`
-when switching agents. Codex uses the configured `sandbox`, Claude runs in
-`plan` permission mode with editing tools disabled, and Kimi receives an
-explicit read-only agent profile limited to `Read`, `Grep`, and `Glob` plus a
-pre-generated PR diff. Kimi's JSONL response is validated against the same
-review result contract before anything can be published. `reasoningEffort`,
-ephemeral sessions, and ignored user configuration apply where supported by the
-selected CLI. An optional `command` can point to a custom executable; built-in
-agent names are treated as defaults and do not need an explicit command path.
+`agents` is an ordered map. Its file order is the review order. Every agent block
+accepts `enabled`, `model`, `effort`, and an optional `command` override. Omit
+`model` to use that CLI's configured default. Legacy top-level `agent`, `model`,
+`reasoningEffort`, and `command` settings remain readable and are migrated to a
+single enabled pipeline entry the next time settings are saved.
+
+Codex receives `model` and `effort` through its CLI and uses the global
+`sandbox`. Claude receives both values and runs in `plan` permission mode with
+editing tools disabled. Kimi receives `model`, but its CLI does not expose an
+effort control; any configured Kimi effort is ignored. It runs with an explicit
+agent profile limited to `Read`, `Grep`, and `Glob` plus a pre-generated PR
+diff. DeepSeek runs through the `deepcode` CLI in a cross-platform pseudo
+terminal because Deep Code requires a TTY. Deep Code receives the model through
+`DEEPCODE_MODEL`; its effort may be `high` or `max` and is passed through
+`DEEPCODE_REASONING_EFFORT`. A temporary project policy allows worktree reads
+and Git inspection while denying writes, deletion, network access, MCP, and Git
+mutation. The original project policy is restored after the stage.
+
+Each agent returns the same `summary` plus `findings` JSON object. The
+coordinator validates the schema and diff anchors, removes exact repeated
+findings, and appends accepted entries to the shared JSONL ledger.
+`timeoutMinutes` applies separately to each agent. Ephemeral sessions and ignored user
+configuration apply where the selected CLI supports them.
 
 `workspaceDirectory` is the root for repository clones and PR worktrees. The
 directory is created when a review first needs it. It accepts an absolute path,
@@ -269,7 +340,7 @@ comments, colons, and nested indentation are preserved.
 
 ## Release
 
-Tagged commits build and publish these raw executable assets:
+Tagged commits build and publish these release assets:
 
 - `pr-linux-x64`
 - `pr-linux-arm64`
@@ -277,6 +348,8 @@ Tagged commits build and publish these raw executable assets:
 - `pr-windows-arm64.exe`
 - `pr-macos-x64`
 - `pr-macos-arm64`
+- `pr-ui-windows-x64.zip`
+- `pr-ui-windows-arm64.zip`
 
 Push a tag such as `v1.0.0` or `release/1.0.0` to create a GitHub release.
 

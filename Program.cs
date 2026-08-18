@@ -64,7 +64,18 @@ try
         return;
     }
 
-    using var singleInstance = SingleInstanceLease.Acquire();
+    if (commandLine.LaunchUi)
+    {
+        if (!UiLauncher.TryLaunch(settings.SettingsPath, out var error))
+        {
+            Console.Error.WriteLine(error);
+            Environment.ExitCode = 1;
+        }
+
+        return;
+    }
+
+    using var singleInstance = SingleInstanceLease.AcquireDashboard(settings.SettingsPath);
 
     if (commandLine.PrintOnce)
     {
@@ -121,6 +132,7 @@ static void PrintUsage()
     Console.Error.WriteLine("  pr <pull-request-number> [pull-request-number...]");
     Console.Error.WriteLine("  pr OWNER/REPO#<pull-request-number>");
     Console.Error.WriteLine("  pr https://github.com/OWNER/REPO/pull/<pull-request-number>");
+    Console.Error.WriteLine("  pr ui");
     Console.Error.WriteLine("  pr --once");
     Console.Error.WriteLine("  pr --cleanup-once");
 }
@@ -253,7 +265,7 @@ internal sealed class DashboardApp
     private const int IgnoreColumn = 6;
 
     private readonly AppSettings _settings;
-    private readonly IReadOnlyList<RepositoryRef> _repositories;
+    private IReadOnlyList<RepositoryRef> _repositories;
     private readonly int _requiredApprovals;
     private readonly string _settingsPath;
     private readonly GhClient _client = new();
@@ -282,12 +294,17 @@ internal sealed class DashboardApp
     private DateTime _settingsLastWriteUtc;
     private CancellationTokenSource? _appCancellation;
     private DashboardView? _dashboard;
+    private Action? _externalStateChanged;
+    private bool _isRefreshing;
+    private bool _isCleaning;
+    private int _refreshRequested;
+    private int _cleanupRequested;
     private CodexReviewSnapshot _codexReviewSnapshot = CodexReviewSnapshot.Disabled;
 
     public DashboardApp(AppSettings settings)
     {
         _settings = settings;
-        _repositories = settings.Repositories;
+        _repositories = settings.Repositories.ToArray();
         _requiredApprovals = settings.RequiredApprovals;
         _settingsPath = settings.SettingsPath;
         _ignoredPullRequestKeys = settings.IgnoredPullRequestKeys;
@@ -316,9 +333,13 @@ internal sealed class DashboardApp
         {
             Tui.Application.Driver.SetCursorVisibility(Tui.CursorVisibility.Invisible);
             dashboard.Build(Tui.Application.Top);
-            dashboard.Refresh(isRefreshing: _repositories.Count > 0, isCleaning: false);
+            _isRefreshing = _repositories.Count > 0;
+            _isCleaning = false;
+            dashboard.Refresh(_isRefreshing, _isCleaning);
 
-            var worker = RunBackgroundLoopAsync(dashboard, appCancellation.Token);
+            var worker = RunBackgroundLoopAsync(
+                (isRefreshing, isCleaning) => RefreshOnUi(dashboard, isRefreshing, isCleaning),
+                appCancellation.Token);
             var codexReviewWorker = _codexReviewWatcher.RunAsync(appCancellation.Token);
             using var cancelRegistration = cancellationToken.Register(RequestStop);
 
@@ -341,7 +362,35 @@ internal sealed class DashboardApp
         }
     }
 
-    private async Task RunBackgroundLoopAsync(DashboardView dashboard, CancellationToken cancellationToken)
+    internal async Task RunHeadlessAsync(Action stateChanged, CancellationToken cancellationToken)
+    {
+        using var appCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _appCancellation = appCancellation;
+        _externalStateChanged = stateChanged;
+        _isRefreshing = _repositories.Count > 0;
+        _isCleaning = false;
+        NotifyExternalStateChanged();
+        try
+        {
+            var worker = RunBackgroundLoopAsync(
+                (_, _) => NotifyExternalStateChanged(),
+                appCancellation.Token);
+            var reviewWorker = _codexReviewWatcher.RunAsync(appCancellation.Token);
+            await Task.WhenAll(worker, reviewWorker);
+        }
+        catch (OperationCanceledException) when (appCancellation.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _externalStateChanged = null;
+            _appCancellation = null;
+        }
+    }
+
+    private async Task RunBackgroundLoopAsync(
+        Action<bool, bool> stateChanged,
+        CancellationToken cancellationToken)
     {
         Task<FetchResult>? refresh = null;
         Task<FetchResult>? priorityRefresh = null;
@@ -351,6 +400,19 @@ internal sealed class DashboardApp
         while (!cancellationToken.IsCancellationRequested)
         {
             var startedWork = false;
+
+            if (refresh is null
+                && priorityRefresh is null
+                && Interlocked.Exchange(ref _refreshRequested, 0) != 0)
+            {
+                _nextRefresh = DateTimeOffset.MinValue;
+            }
+
+            if (cleanup is null
+                && Interlocked.Exchange(ref _cleanupRequested, 0) != 0)
+            {
+                _nextCleanup = DateTimeOffset.MinValue;
+            }
 
             if (refresh is null && priorityRefresh is null && DateTimeOffset.UtcNow >= _nextRefresh)
             {
@@ -383,7 +445,7 @@ internal sealed class DashboardApp
 
             if (startedWork)
             {
-                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, cleanup is not null);
+                PublishStateChanged(stateChanged, refresh is not null || priorityRefresh is not null, cleanup is not null);
             }
 
             if (refresh is not null && refresh.IsCompleted)
@@ -423,7 +485,7 @@ internal sealed class DashboardApp
                     refreshIsFirstPageOnly = false;
                 }
 
-                RefreshOnUi(dashboard, isRefreshing: refresh is not null || priorityRefresh is not null, cleanup is not null);
+                PublishStateChanged(stateChanged, refresh is not null || priorityRefresh is not null, cleanup is not null);
             }
 
             if (priorityRefresh is not null && priorityRefresh.IsCompleted)
@@ -439,7 +501,7 @@ internal sealed class DashboardApp
                 }
 
                 priorityRefresh = null;
-                RefreshOnUi(dashboard, refresh is not null, cleanup is not null);
+                PublishStateChanged(stateChanged, refresh is not null, cleanup is not null);
             }
 
             if (cleanup is not null && cleanup.IsCompleted)
@@ -455,12 +517,12 @@ internal sealed class DashboardApp
                 }
 
                 cleanup = null;
-                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, isCleaning: false);
+                PublishStateChanged(stateChanged, refresh is not null || priorityRefresh is not null, isCleaning: false);
             }
 
             if (ReloadSettingsIfChanged())
             {
-                RefreshOnUi(dashboard, refresh is not null || priorityRefresh is not null, cleanup is not null);
+                PublishStateChanged(stateChanged, refresh is not null || priorityRefresh is not null, cleanup is not null);
             }
 
             await Task.Delay(100, cancellationToken);
@@ -496,6 +558,24 @@ internal sealed class DashboardApp
         try
         {
             Tui.Application.MainLoop.Invoke(() => dashboard.Refresh(isRefreshing, isCleaning));
+        }
+        catch
+        {
+        }
+    }
+
+    private void PublishStateChanged(Action<bool, bool> stateChanged, bool isRefreshing, bool isCleaning)
+    {
+        _isRefreshing = isRefreshing;
+        _isCleaning = isCleaning;
+        stateChanged(isRefreshing, isCleaning);
+    }
+
+    private void NotifyExternalStateChanged()
+    {
+        try
+        {
+            _externalStateChanged?.Invoke();
         }
         catch
         {
@@ -634,9 +714,9 @@ internal sealed class DashboardApp
         return changed;
     }
 
-    private IReadOnlyList<PullRequestInfo> GetVisiblePullRequests(string titleSearch = "")
+    private IReadOnlyList<PullRequestInfo> GetVisiblePullRequests(string searchText = "")
     {
-        var search = titleSearch.Trim();
+        var search = searchText.Trim();
         var includeIgnored = search.Length > 0 || _showIgnoredPullRequests;
         var pendingReviewedKeys = _codexReviewSnapshot.PendingReviewedPullRequests
             .Select(pullRequest => pullRequest.Key)
@@ -677,10 +757,47 @@ internal sealed class DashboardApp
         var filtered = search.Length == 0
             ? source.ToArray()
             : source
-                .Where(item => item.Title.Contains(search, StringComparison.CurrentCultureIgnoreCase))
+                .Where(item => item.MatchesSearch(search))
                 .ToArray();
 
         return SortTopFirst(filtered);
+    }
+
+    internal DashboardSnapshot GetSnapshot(string searchText = "")
+    {
+        var items = GetVisiblePullRequests(searchText)
+            .Select(pullRequest => new DashboardPullRequest(
+                pullRequest,
+                IsIgnored(pullRequest),
+                IsTop(pullRequest),
+                IsCodexReviewed(pullRequest),
+                IsCodexReviewQueued(pullRequest),
+                CodexReviewFor(pullRequest)))
+            .ToArray();
+        return new DashboardSnapshot(
+            Items: items,
+            Repositories: _repositories.ToArray(),
+            RequiredApprovals: _requiredApprovals,
+            RepositorySummary: RepositorySummary(),
+            EmptyMessage: EmptyListMessage(),
+            CurrentUserLogin: _currentUserLogin,
+            IsRefreshing: _isRefreshing,
+            IsCleaning: _isCleaning,
+            ShowIgnoredPullRequests: _showIgnoredPullRequests,
+            OpenNonDraftCount: _openNonDraftCount,
+            IgnoredPullRequestCount: _ignoredPullRequestCount,
+            ApiCalls: _apiCalls,
+            LastRefresh: _lastRefresh,
+            LastCleanup: _lastCleanup,
+            LastCleanupScanned: _lastCleanupScanned,
+            LastCleanupMarkedRead: _lastCleanupMarkedRead,
+            LastCleanupRemovedIgnored: _lastCleanupRemovedIgnored,
+            Error: _error,
+            CleanupError: _cleanupError,
+            CanCleanup: CanCleanup(),
+            Review: _codexReviewSnapshot,
+            ReviewSettings: _settings.CodexReview,
+            SettingsPath: _settingsPath);
     }
 
     private IReadOnlyList<PullRequestInfo> SortTopFirst(IReadOnlyList<PullRequestInfo> source)
@@ -734,7 +851,7 @@ internal sealed class DashboardApp
             reviewed => string.Equals(reviewed.Key, pullRequest.Key, StringComparison.OrdinalIgnoreCase));
     }
 
-    private bool ToggleIgnored(PullRequestInfo pullRequest)
+    internal bool ToggleIgnored(PullRequestInfo pullRequest)
     {
         if (IsIgnored(pullRequest))
         {
@@ -749,10 +866,11 @@ internal sealed class DashboardApp
         _settingsLastWriteUtc = GetSettingsLastWriteUtc();
         RefreshIgnoredPullRequests();
         _codexReviewWatcher.Wake();
+        NotifyExternalStateChanged();
         return true;
     }
 
-    private bool ToggleTop(PullRequestInfo pullRequest)
+    internal bool ToggleTop(PullRequestInfo pullRequest)
     {
         if (IsTop(pullRequest))
         {
@@ -766,6 +884,7 @@ internal sealed class DashboardApp
         _settings.Save();
         _settingsLastWriteUtc = GetSettingsLastWriteUtc();
         RefreshTopPullRequests();
+        NotifyExternalStateChanged();
         return true;
     }
 
@@ -776,7 +895,11 @@ internal sealed class DashboardApp
 
     private bool ToggleCodexReview()
     {
-        var enabled = !_settings.CodexReview.Enabled;
+        return SetCodexReviewEnabled(!_settings.CodexReview.Enabled);
+    }
+
+    internal bool SetCodexReviewEnabled(bool enabled)
+    {
         if (!_settings.SetCodexReviewEnabled(enabled))
         {
             return false;
@@ -792,12 +915,17 @@ internal sealed class DashboardApp
                 : $"{_settings.CodexReview.AgentDescriptor} review off",
         };
         _codexReviewWatcher.Wake();
+        NotifyExternalStateChanged();
         return true;
     }
 
     private bool ToggleCodexReviewAutoSubmit()
     {
-        var autoSubmit = !_settings.CodexReview.AutoSubmit;
+        return SetCodexReviewAutoSubmit(!_settings.CodexReview.AutoSubmit);
+    }
+
+    internal bool SetCodexReviewAutoSubmit(bool autoSubmit)
+    {
         if (!_settings.SetCodexReviewAutoSubmit(autoSubmit))
         {
             return false;
@@ -812,10 +940,11 @@ internal sealed class DashboardApp
                 : $"{_settings.CodexReview.AgentDescriptor} drafts only",
         };
         _codexReviewWatcher.Wake();
+        NotifyExternalStateChanged();
         return true;
     }
 
-    private bool AcknowledgeCodexReview(PullRequestInfo pullRequest)
+    internal bool AcknowledgeCodexReview(PullRequestInfo pullRequest)
     {
         if (!_codexReviewWatcher.Acknowledge(pullRequest.Key))
         {
@@ -828,6 +957,7 @@ internal sealed class DashboardApp
         {
             [pullRequest.Key] = pullRequest,
         };
+        NotifyExternalStateChanged();
         return true;
     }
 
@@ -836,14 +966,15 @@ internal sealed class DashboardApp
         return _codexReviewWatcher.IsManuallyQueued(pullRequest.Key);
     }
 
-    private void EnqueueCodexReview(PullRequestInfo pullRequest)
+    internal CodexReviewEnqueueResult EnqueueCodexReview(PullRequestInfo pullRequest)
     {
-        _codexReviewWatcher.Enqueue(pullRequest);
+        return _codexReviewWatcher.Enqueue(pullRequest);
     }
 
     private void ApplyCodexReviewSnapshot(CodexReviewSnapshot snapshot)
     {
         _codexReviewSnapshot = snapshot;
+        NotifyExternalStateChanged();
         var dashboard = _dashboard;
         if (dashboard is null)
         {
@@ -865,15 +996,27 @@ internal sealed class DashboardApp
         return true;
     }
 
-    private void RequestRefresh()
+    internal bool SetIgnoredVisibility(bool showIgnored)
     {
-        _nextRefresh = DateTimeOffset.MinValue;
+        if (_showIgnoredPullRequests == showIgnored)
+        {
+            return false;
+        }
+
+        _showIgnoredPullRequests = showIgnored;
+        NotifyExternalStateChanged();
+        return true;
+    }
+
+    internal void RequestRefresh()
+    {
+        Interlocked.Exchange(ref _refreshRequested, 1);
         _error = null;
     }
 
-    private void RequestCleanup()
+    internal void RequestCleanup()
     {
-        _nextCleanup = DateTimeOffset.MinValue;
+        Interlocked.Exchange(ref _cleanupRequested, 1);
         _cleanupError = null;
     }
 
@@ -884,9 +1027,26 @@ internal sealed class DashboardApp
             || _settings.TopPullRequests.Count > 0;
     }
 
-    private Task<WeeklyStats> FetchWeeklyStatsAsync(CancellationToken cancellationToken)
+    internal Task<WeeklyStats> FetchWeeklyStatsAsync(CancellationToken cancellationToken)
     {
         return _client.FetchWeeklyStatsAsync(_repositories, cancellationToken);
+    }
+
+    internal SettingsUpdateResult AddRepositories(IReadOnlyList<RepositoryRef> repositories)
+    {
+        var update = _settings.AddRepositories(repositories);
+        if (update.Added.Count == 0)
+        {
+            return update;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _repositories = _settings.Repositories.ToArray();
+        _codexReviewWatcher.ReplaceRepositories(_repositories);
+        RequestRefresh();
+        NotifyExternalStateChanged();
+        return update;
     }
 
     private string RepositorySummary()
@@ -1030,7 +1190,7 @@ internal sealed class DashboardApp
         private bool _isCleaning;
         private bool _isSearchActive;
         private bool _suppressSearchChanged;
-        private string _titleSearch = "";
+        private string _searchText = "";
 
         public DashboardView(DashboardApp owner)
         {
@@ -1060,12 +1220,12 @@ internal sealed class DashboardApp
 
             _title = new Tui.Label(1, 0, "GitHub PR Control Panel", false)
             {
-                Width = Tui.Dim.Percent(45),
+                Width = Tui.Dim.Percent(35),
                 Height = 1,
             };
             _status = new Tui.Label
             {
-                X = Tui.Pos.Percent(45),
+                X = Tui.Pos.Percent(35),
                 Y = 0,
                 Width = Tui.Dim.Fill(),
                 Height = 1,
@@ -1075,12 +1235,12 @@ internal sealed class DashboardApp
             {
                 X = 1,
                 Y = 1,
-                Width = Tui.Dim.Percent(45),
+                Width = Tui.Dim.Percent(35),
                 Height = 1,
             };
             _scan = new Tui.Label
             {
-                X = Tui.Pos.Percent(45),
+                X = Tui.Pos.Percent(35),
                 Y = 1,
                 Width = Tui.Dim.Fill(),
                 Height = 1,
@@ -1123,7 +1283,7 @@ internal sealed class DashboardApp
                     return;
                 }
 
-                _titleSearch = _searchField.Text.ToString() ?? "";
+                _searchText = _searchField.Text.ToString() ?? "";
                 Refresh(_isRefreshing, _isCleaning);
             };
             _searchField.KeyPress += HandleKeyPress;
@@ -1198,7 +1358,7 @@ internal sealed class DashboardApp
         {
             _isRefreshing = isRefreshing;
             _isCleaning = isCleaning;
-            _visiblePullRequests = _owner.GetVisiblePullRequests(_titleSearch);
+            _visiblePullRequests = _owner.GetVisiblePullRequests(_searchText);
             _columns = CalculateColumnLayout();
             _table.MaxCellWidth = Math.Max(200, _columns.Title);
 
@@ -1432,7 +1592,10 @@ internal sealed class DashboardApp
                             : codexReview.ReviewCreated
                                 ? "draft"
                                 : "complete";
-                    title = $"[{codexReview.AgentDisplayName} {delivery} {result}] {title}";
+                    var agentPrefix = codexReview.AgentLetterPrefix;
+                    title = string.IsNullOrEmpty(agentPrefix)
+                        ? $"[{delivery} {result}] {title}"
+                        : $"{agentPrefix} [{delivery} {result}] {title}";
                 }
 
                 table.Rows.Add(
@@ -1641,7 +1804,7 @@ internal sealed class DashboardApp
         private string ScanText()
         {
             var pendingReviews = _owner._codexReviewSnapshot.PendingReviewedPullRequests.Count;
-            var scanText = Truncate(_owner._codexReviewSnapshot.Message, 42);
+            var scanText = _owner._codexReviewSnapshot.Message;
             scanText += $", {_owner._codexReviewSnapshot.WaitingCount.ToString(CultureInfo.InvariantCulture)} pending";
             if (_owner._codexReviewSnapshot.NextReadyAt is { } nextReadyAt)
             {
@@ -1700,10 +1863,10 @@ internal sealed class DashboardApp
 
         private string SummaryText()
         {
-            var search = _titleSearch.Trim();
+            var search = _searchText.Trim();
             if (search.Length > 0)
             {
-                return $"{_visiblePullRequests.Count} title match(es) for \"{Truncate(search, 32)}\"; ignored included";
+                return $"{_visiblePullRequests.Count} match(es) for \"{Truncate(search, 32)}\"; ignored included";
             }
 
             return $"{_visiblePullRequests.Count} visible PRs below {_owner._requiredApprovals} approvals";
@@ -1736,9 +1899,9 @@ internal sealed class DashboardApp
                     : "C clean";
             var errors = string.Join(" ", new[] { _owner._error, _owner._cleanupError }.Where(error => !string.IsNullOrWhiteSpace(error)));
             var suffix = string.IsNullOrWhiteSpace(errors) ? "" : $"  {errors}";
-            var search = string.IsNullOrWhiteSpace(_titleSearch)
+            var search = string.IsNullOrWhiteSpace(_searchText)
                 ? (_isSearchActive ? "Esc cancel search" : "F1 search")
-                : $"F1 search '{Truncate(_titleSearch, 20)}'  Esc cancel search";
+                : $"F1 search '{Truncate(_searchText, 20)}'  Esc cancel search";
             var reviewAgent = _owner._settings.CodexReview.AgentDisplayName;
             var codexReview = _owner._settings.CodexReview.Enabled
                 ? $"V {reviewAgent} off"
@@ -1884,7 +2047,7 @@ internal sealed class DashboardApp
         {
             _isSearchActive = true;
             _suppressSearchChanged = true;
-            _searchField.Text = _titleSearch;
+            _searchField.Text = _searchText;
             _suppressSearchChanged = false;
             Refresh(_isRefreshing, _isCleaning);
             _searchField.SetFocus();
@@ -1893,7 +2056,7 @@ internal sealed class DashboardApp
         private void CancelSearch()
         {
             _isSearchActive = false;
-            _titleSearch = "";
+            _searchText = "";
             _suppressSearchChanged = true;
             _searchField.Text = "";
             _suppressSearchChanged = false;
@@ -3726,6 +3889,8 @@ internal sealed class AppSettings
         var requiredApprovals = DefaultRequiredApprovals;
         var priority = PrioritySettings.Default.ToBuilder();
         var codexReview = CodexReviewSettings.Default.ToBuilder();
+        codexReview.HasAgentPipeline = false;
+        codexReview.Agents.Clear();
         var activeList = SettingsList.None;
         var activeSection = SettingsSection.None;
 
@@ -3823,6 +3988,19 @@ internal sealed class AppSettings
                     ref lineIndex,
                     GetIndentation(rawLine),
                     codexReview.Contexts);
+                continue;
+            }
+
+            if (activeSection == SettingsSection.CodexReview
+                && (line.Equals("agents:", StringComparison.OrdinalIgnoreCase)
+                    || line.Equals("reviewers:", StringComparison.OrdinalIgnoreCase)))
+            {
+                activeList = SettingsList.None;
+                ReadCodexReviewAgents(
+                    lines,
+                    ref lineIndex,
+                    GetIndentation(rawLine),
+                    codexReview);
                 continue;
             }
 
@@ -4082,21 +4260,30 @@ internal sealed class AppSettings
         builder.AppendLine($"  startupScanDays: {CodexReview.StartupScanDays.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine($"  eligibilityCheckSeconds: {CodexReview.EligibilityCheckSeconds.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine($"  maxOpenPullRequests: {CodexReview.MaxOpenPullRequests.ToString(CultureInfo.InvariantCulture)}");
-        builder.AppendLine($"  agent: {CodexReview.AgentName}");
-        if (!string.IsNullOrWhiteSpace(CodexReview.ResolvedModel))
+        builder.AppendLine("  agents:");
+        foreach (var agent in CodexReview.Agents)
         {
-            builder.AppendLine($"  model: {CodexReview.ResolvedModel}");
-        }
+            builder.AppendLine($"    {agent.AgentName}:");
+            builder.AppendLine($"      enabled: {agent.Enabled.ToString().ToLowerInvariant()}");
+            if (!string.IsNullOrWhiteSpace(agent.Model))
+            {
+                builder.AppendLine($"      model: {agent.Model}");
+            }
 
-        if (!string.IsNullOrWhiteSpace(CodexReview.Command))
-        {
-            builder.AppendLine($"  command: {CodexReview.Command}");
+            if (!string.IsNullOrWhiteSpace(agent.Effort))
+            {
+                builder.AppendLine($"      effort: {agent.Effort}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(agent.Command))
+            {
+                builder.AppendLine($"      command: {agent.Command}");
+            }
         }
 
         builder.AppendLine($"  sandbox: {CodexReview.Sandbox}");
         builder.AppendLine($"  ephemeral: {CodexReview.Ephemeral.ToString().ToLowerInvariant()}");
         builder.AppendLine($"  ignoreUserConfig: {CodexReview.IgnoreUserConfig.ToString().ToLowerInvariant()}");
-        builder.AppendLine($"  reasoningEffort: {CodexReview.ReasoningEffort}");
         builder.AppendLine($"  maxFindings: {CodexReview.MaxFindings.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine($"  skipWhenApprovalCountAtLeast: {CodexReview.SkipWhenApprovalCountAtLeast.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine($"  skipWhenUniqueCommentersAtLeast: {CodexReview.SkipWhenUniqueCommentersAtLeast.ToString(CultureInfo.InvariantCulture)}");
@@ -4132,6 +4319,71 @@ internal sealed class AppSettings
         }
 
         File.WriteAllText(SettingsPath, builder.ToString(), Encoding.UTF8);
+    }
+
+    private static void ReadCodexReviewAgents(
+        IReadOnlyList<string> lines,
+        ref int lineIndex,
+        int agentsIndent,
+        CodexReviewSettingsBuilder settings)
+    {
+        settings.HasAgentPipeline = true;
+        settings.Agents.Clear();
+        ReviewAgentSettingsBuilder? activeAgent = null;
+        var activeAgentIndent = -1;
+        var index = lineIndex + 1;
+        while (index < lines.Count)
+        {
+            var rawLine = lines[index];
+            if (string.IsNullOrWhiteSpace(rawLine))
+            {
+                index++;
+                continue;
+            }
+
+            var indentation = GetIndentation(rawLine);
+            if (indentation <= agentsIndent)
+            {
+                break;
+            }
+
+            var line = StripComment(rawLine).Trim();
+            if (line.Length == 0)
+            {
+                index++;
+                continue;
+            }
+
+            if (line.EndsWith(':') && indentation == agentsIndent + 2)
+            {
+                var agentName = ParseYamlKey(line[..^1].Trim());
+                if (CodexReviewSettings.TryParseAgent(agentName, out var agent))
+                {
+                    activeAgent = ReviewAgentSettings.DefaultFor(agent).ToBuilder();
+                    activeAgent.Enabled = true;
+                    activeAgentIndent = indentation;
+                    settings.Agents.RemoveAll(existing => existing.Agent == agent);
+                    settings.Agents.Add(activeAgent);
+                }
+                else
+                {
+                    activeAgent = null;
+                    activeAgentIndent = -1;
+                }
+
+                index++;
+                continue;
+            }
+
+            if (activeAgent is not null && indentation > activeAgentIndent)
+            {
+                ReviewAgentSettingsBuilder.TryApply(activeAgent, line);
+            }
+
+            index++;
+        }
+
+        lineIndex = index - 1;
     }
 
     private static void ReadCodexReviewContexts(
@@ -4294,6 +4546,12 @@ internal sealed class AppSettings
 
     private static string GetSettingsPath()
     {
+        var configuredPath = Environment.GetEnvironmentVariable(UiLauncher.SettingsPathEnvironmentVariable);
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return Path.GetFullPath(configuredPath.Trim());
+        }
+
         var baseDirectory = Path.GetFullPath(AppContext.BaseDirectory);
         return Path.Combine(baseDirectory, ".pr.yml");
     }
@@ -4385,7 +4643,7 @@ internal sealed record PrioritySettings(
         NoReviewsNoCommentsPoints: 10,
         TwentyDaysPoints: 35,
         LessThanThreeHoursNoCommentsPoints: -30,
-        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "kimi", "copilot"]);
+        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "kimi", "deepseek", "deepcode", "copilot"]);
 
     public PrioritySettingsBuilder ToBuilder()
     {
@@ -4631,13 +4889,14 @@ internal static class LegacyProtocolHandler
 
 internal sealed record CommandLine(
     bool ShowHelp,
+    bool LaunchUi,
     bool PrintOnce,
     bool CleanupOnce,
     IReadOnlyList<RepositoryRef> RepositoriesToAdd,
     IReadOnlyList<PullRequestTarget> PullRequests,
     string? Error)
 {
-    public bool HasRuntimeAction => PrintOnce || CleanupOnce || PullRequests.Count > 0;
+    public bool HasRuntimeAction => LaunchUi || PrintOnce || CleanupOnce || PullRequests.Count > 0;
 
     public static CommandLine Parse(string[] args)
     {
@@ -4653,6 +4912,7 @@ internal sealed record CommandLine(
 
         var printOnce = false;
         var cleanupOnce = false;
+        var launchUi = false;
         var repositories = new List<RepositoryRef>();
         var pullRequests = new List<PullRequestTarget>();
 
@@ -4672,6 +4932,12 @@ internal sealed record CommandLine(
             if (string.Equals(rawToken, "--cleanup-once", StringComparison.OrdinalIgnoreCase))
             {
                 cleanupOnce = true;
+                continue;
+            }
+
+            if (string.Equals(rawToken, "ui", StringComparison.OrdinalIgnoreCase))
+            {
+                launchUi = true;
                 continue;
             }
 
@@ -4705,12 +4971,17 @@ internal sealed record CommandLine(
             return Empty() with { Error = "PR opening cannot be combined with --once or --cleanup-once." };
         }
 
-        return new CommandLine(false, printOnce, cleanupOnce, repositories, pullRequests, null);
+        if (launchUi && (printOnce || cleanupOnce || pullRequests.Count > 0))
+        {
+            return Empty() with { Error = "ui cannot be combined with PR opening, --once, or --cleanup-once." };
+        }
+
+        return new CommandLine(false, launchUi, printOnce, cleanupOnce, repositories, pullRequests, null);
     }
 
     private static CommandLine Empty()
     {
-        return new CommandLine(false, false, false, [], [], null);
+        return new CommandLine(false, false, false, false, [], [], null);
     }
 
     private static IEnumerable<string> ExpandTokens(string[] args)
@@ -4982,6 +5253,22 @@ internal sealed record PullRequestInfo(
     public string Key => $"{Repository.FullName}#{Number.ToString(CultureInfo.InvariantCulture)}";
 
     public bool IsExternalContributor => GitHubAuthorAssociation.IsExternal(AuthorAssociation);
+
+    public bool MatchesSearch(string searchText)
+    {
+        var search = searchText.Trim();
+        if (search.Length == 0)
+        {
+            return true;
+        }
+
+        var number = Number.ToString(CultureInfo.InvariantCulture);
+        return Title.Contains(search, StringComparison.CurrentCultureIgnoreCase)
+            || Author.Contains(search, StringComparison.CurrentCultureIgnoreCase)
+            || $"@{Author}".Contains(search, StringComparison.CurrentCultureIgnoreCase)
+            || number.Contains(search, StringComparison.Ordinal)
+            || $"#{number}".Contains(search, StringComparison.Ordinal);
+    }
 }
 
 internal sealed record PriorityDetail(

@@ -14,6 +14,7 @@ internal sealed class SingleInstanceLease : IDisposable
     private readonly string _ownerPath;
     private readonly InstanceOwner _owner;
     private readonly TimeSpan _takeoverTimeout;
+    private readonly bool _requireSameExecutable;
     private readonly ManualResetEventSlim _release = new(initialState: false);
     private readonly TaskCompletionSource _acquired = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Thread _ownerThread;
@@ -23,12 +24,14 @@ internal sealed class SingleInstanceLease : IDisposable
         string mutexName,
         string ownerPath,
         InstanceOwner owner,
-        TimeSpan takeoverTimeout)
+        TimeSpan takeoverTimeout,
+        bool requireSameExecutable)
     {
         _mutexName = mutexName;
         _ownerPath = ownerPath;
         _owner = owner;
         _takeoverTimeout = takeoverTimeout;
+        _requireSameExecutable = requireSameExecutable;
         _ownerThread = new Thread(OwnMutex)
         {
             IsBackground = true,
@@ -39,20 +42,22 @@ internal sealed class SingleInstanceLease : IDisposable
     public static SingleInstanceLease Acquire(
         string? scope = null,
         string? lockDirectory = null,
-        TimeSpan? takeoverTimeout = null)
+        TimeSpan? takeoverTimeout = null,
+        bool shareAcrossExecutables = false)
     {
         var executablePath = CurrentExecutablePath();
         var owner = new InstanceOwner(
             Environment.ProcessId,
             Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks,
             executablePath);
-        var paths = GetPaths(executablePath, scope, lockDirectory);
+        var paths = GetPaths(executablePath, scope, lockDirectory, shareAcrossExecutables);
         Directory.CreateDirectory(paths.Directory);
         var lease = new SingleInstanceLease(
             paths.MutexName,
             paths.OwnerPath,
             owner,
-            takeoverTimeout ?? DefaultTakeoverTimeout);
+            takeoverTimeout ?? DefaultTakeoverTimeout,
+            requireSameExecutable: !shareAcrossExecutables);
         lease._ownerThread.Start();
         try
         {
@@ -64,6 +69,21 @@ internal sealed class SingleInstanceLease : IDisposable
             lease.Dispose();
             throw;
         }
+    }
+
+    public static SingleInstanceLease AcquireDashboard(
+        string settingsPath,
+        string? lockDirectory = null,
+        TimeSpan? takeoverTimeout = null)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? Path.GetFullPath(settingsPath).ToUpperInvariant()
+            : Path.GetFullPath(settingsPath);
+        return Acquire(
+            scope: "dashboard\n" + comparison,
+            lockDirectory,
+            takeoverTimeout,
+            shareAcrossExecutables: true);
     }
 
     public void Dispose()
@@ -105,7 +125,10 @@ internal sealed class SingleInstanceLease : IDisposable
                     return;
                 }
 
-                TryTerminatePreviousOwner(_ownerPath, _owner.ExecutablePath);
+                TryTerminatePreviousOwner(
+                    _ownerPath,
+                    _owner.ExecutablePath,
+                    _requireSameExecutable);
                 if (timer.Elapsed >= _takeoverTimeout)
                 {
                     throw new SingleInstanceException(
@@ -137,7 +160,11 @@ internal sealed class SingleInstanceLease : IDisposable
         }
     }
 
-    private static InstancePaths GetPaths(string executablePath, string? scope, string? lockDirectory)
+    private static InstancePaths GetPaths(
+        string executablePath,
+        string? scope,
+        string? lockDirectory,
+        bool shareAcrossExecutables)
     {
         var directory = string.IsNullOrWhiteSpace(lockDirectory)
             ? Path.Combine(Path.GetTempPath(), "pr-single-instance")
@@ -145,13 +172,15 @@ internal sealed class SingleInstanceLease : IDisposable
         var comparisonPath = OperatingSystem.IsWindows()
             ? executablePath.ToUpperInvariant()
             : executablePath;
-        var identity = string.Join(
-            "\n",
-            Environment.UserName,
-            comparisonPath,
-            Path.GetFullPath(AppContext.BaseDirectory),
-            Assembly.GetEntryAssembly()?.GetName().Name,
-            scope?.Trim());
+        var identity = shareAcrossExecutables
+            ? string.Join("\n", Environment.UserName, scope?.Trim())
+            : string.Join(
+                "\n",
+                Environment.UserName,
+                comparisonPath,
+                Path.GetFullPath(AppContext.BaseDirectory),
+                Assembly.GetEntryAssembly()?.GetName().Name,
+                scope?.Trim());
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
         return new InstancePaths(
             directory,
@@ -159,12 +188,15 @@ internal sealed class SingleInstanceLease : IDisposable
             Path.Combine(directory, hash + ".owner.json"));
     }
 
-    private static void TryTerminatePreviousOwner(string ownerPath, string executablePath)
+    private static void TryTerminatePreviousOwner(
+        string ownerPath,
+        string executablePath,
+        bool requireSameExecutable)
     {
         var owner = ReadOwner(ownerPath);
         if (owner is null
             || owner.ProcessId == Environment.ProcessId
-            || !PathsEqual(owner.ExecutablePath, executablePath))
+            || (requireSameExecutable && !PathsEqual(owner.ExecutablePath, executablePath)))
         {
             return;
         }

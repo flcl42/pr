@@ -90,9 +90,53 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  build-ui:
+    name: build pr-ui ${{ matrix.rid }}
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            asset: pr-ui-windows-x64.zip
+          - rid: win-arm64
+            asset: pr-ui-windows-arm64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Install optional Windows MAUI workload
+        run: dotnet workload install maui-windows
+      - name: Publish desktop companion
+        shell: pwsh
+        run: >
+          dotnet publish ./Pr.Maui/Pr.Maui.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained true
+          -p:WindowsPackageType=None
+          -p:DebugType=none
+          -p:DebugSymbols=false
+          -o publish-ui/${{ matrix.rid }}
+      - name: Stage desktop companion
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/stage | Out-Null
+          Copy-Item "publish-ui/${{ matrix.rid }}/*" dist/stage -Recurse
+          Remove-Item -LiteralPath "dist/stage/pr.exe","dist/stage/pr.deps.json","dist/stage/pr.runtimeconfig.json" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist/stage/*" -DestinationPath "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 0
+
   release:
     name: publish release
-    needs: build
+    needs: [build, build-ui]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Pr.csproj" />
+  <Project Path="Pr.Maui/Pr.Maui.csproj" />
+  <Project Path="tests/Pr.Tests.csproj" />
+</Solution>

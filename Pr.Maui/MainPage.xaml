@@ -1,0 +1,325 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="PrDesktop.MainPage"
+             x:Name="RootPage"
+             Title="PRs">
+    <Grid RowDefinitions="Auto,Auto,*" RowSpacing="0">
+        <Grid Grid.Row="0"
+              ColumnDefinitions="Auto,*,Auto"
+              ColumnSpacing="14"
+              Padding="18,12,18,10"
+              BackgroundColor="{StaticResource SurfaceColor}">
+            <Label Text="PRs"
+                   FontSize="24"
+                   FontAttributes="Bold"
+                   VerticalOptions="Center" />
+            <VerticalStackLayout Grid.Column="1" Spacing="0" VerticalOptions="Center">
+                <Label x:Name="RepositorySummaryLabel"
+                       FontAttributes="Bold"
+                       LineBreakMode="TailTruncation" />
+                <Label x:Name="ReviewSummaryLabel"
+                       Style="{StaticResource Caption}"
+                       LineBreakMode="TailTruncation" />
+            </VerticalStackLayout>
+            <HorizontalStackLayout Grid.Column="2" Spacing="7" VerticalOptions="Center">
+                <Button x:Name="RefreshButton"
+                        Text="Refresh"
+                        Clicked="OnRefreshClicked"
+                        ToolTipProperties.Text="Refresh tracked pull requests" />
+                <Button x:Name="CleanupButton"
+                        Text="Clean"
+                        Clicked="OnCleanupClicked"
+                        ToolTipProperties.Text="Clean stale notifications and saved PRs" />
+                <Button Text="Stats"
+                        Clicked="OnStatsClicked"
+                        ToolTipProperties.Text="Show this week's pull request and review totals" />
+                <Button Text="Add repo"
+                        Style="{StaticResource PrimaryButton}"
+                        Clicked="OnAddRepositoryClicked"
+                        ToolTipProperties.Text="Track another GitHub repository" />
+            </HorizontalStackLayout>
+        </Grid>
+
+        <Grid Grid.Row="1"
+              ColumnDefinitions="*,Auto,Auto"
+              ColumnSpacing="12"
+              Padding="18,10"
+              BackgroundColor="{StaticResource CanvasColor}">
+            <Border Grid.Column="0"
+                    BackgroundColor="{StaticResource SurfaceColor}"
+                    Stroke="{StaticResource BorderColor}"
+                    StrokeThickness="1"
+                    StrokeShape="RoundRectangle 5"
+                    Padding="10,0">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                    <Label Text="Search"
+                           TextColor="{StaticResource MutedColor}"
+                           VerticalOptions="Center" />
+                    <Entry x:Name="SearchEntry"
+                           Grid.Column="1"
+                           Placeholder="Title, PR number, or author"
+                           ClearButtonVisibility="WhileEditing"
+                           TextChanged="OnSearchTextChanged" />
+                </Grid>
+            </Border>
+            <HorizontalStackLayout Grid.Column="1" Spacing="8" VerticalOptions="Center">
+                <ActivityIndicator x:Name="RefreshIndicator"
+                                   WidthRequest="18"
+                                   HeightRequest="18"
+                                   Color="{StaticResource WarningColor}" />
+                <Label x:Name="RefreshStateLabel"
+                       FontAttributes="Bold"
+                       VerticalOptions="Center" />
+            </HorizontalStackLayout>
+            <HorizontalStackLayout Grid.Column="2" Spacing="6" VerticalOptions="Center">
+                <Label Text="Show ignored" VerticalOptions="Center" />
+                <Switch x:Name="ShowIgnoredSwitch" Toggled="OnShowIgnoredToggled" />
+            </HorizontalStackLayout>
+        </Grid>
+
+        <Grid Grid.Row="2"
+              ColumnDefinitions="2.15*,1*"
+              ColumnSpacing="12"
+              Padding="18,0,18,16">
+            <Border Grid.Column="0"
+                    BackgroundColor="{StaticResource SurfaceColor}"
+                    Stroke="{StaticResource BorderColor}"
+                    StrokeThickness="1"
+                    StrokeShape="RoundRectangle 6">
+                <Grid RowDefinitions="Auto,*">
+                    <Grid Grid.Row="0"
+                          ColumnDefinitions="110,64,*,120,78,78"
+                          ColumnSpacing="8"
+                          Padding="10,8"
+                          BackgroundColor="#F6F8FA">
+                        <Label Text="Repo" Style="{StaticResource Caption}" FontAttributes="Bold" />
+                        <Label Grid.Column="1" Text="PR" Style="{StaticResource Caption}" FontAttributes="Bold" HorizontalTextAlignment="Center" />
+                        <Label Grid.Column="2" Text="Title" Style="{StaticResource Caption}" FontAttributes="Bold" />
+                        <Label Grid.Column="3" Text="Author" Style="{StaticResource Caption}" FontAttributes="Bold" />
+                        <Label Grid.Column="4" Text="Created" Style="{StaticResource Caption}" FontAttributes="Bold" />
+                        <Label Grid.Column="5" Text="Approvals" Style="{StaticResource Caption}" FontAttributes="Bold" HorizontalTextAlignment="Center" />
+                    </Grid>
+
+                    <Grid Grid.Row="1">
+                        <CollectionView x:Name="PullRequestList"
+                                        IsGrouped="True"
+                                        SelectionMode="Single"
+                                        SelectionChanged="OnPullRequestSelectionChanged">
+                            <CollectionView.GroupHeaderTemplate>
+                                <DataTemplate>
+                                    <Grid ColumnDefinitions="*,Auto"
+                                          Padding="10,5"
+                                          BackgroundColor="#EEF1F4">
+                                        <Label Text="{Binding Name}"
+                                               FontAttributes="Bold"
+                                               FontSize="12" />
+                                        <Label Grid.Column="1"
+                                               Text="{Binding CountLabel}"
+                                               Style="{StaticResource Caption}" />
+                                    </Grid>
+                                </DataTemplate>
+                            </CollectionView.GroupHeaderTemplate>
+                            <CollectionView.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid RowDefinitions="Auto,1"
+                                          BackgroundColor="{Binding BackgroundColor}">
+                                        <Grid Grid.Row="0"
+                                              ColumnDefinitions="110,64,*,120,78,78"
+                                              ColumnSpacing="8"
+                                              Padding="10,5"
+                                              MinimumHeightRequest="42">
+                                            <Label Text="{Binding RepositoryName}"
+                                                   VerticalOptions="Center"
+                                                   LineBreakMode="TailTruncation" />
+                                            <Button Grid.Column="1"
+                                                    Text="{Binding NumberText}"
+                                                    TextColor="{Binding HeatColor}"
+                                                    FontAttributes="Bold"
+                                                    Style="{StaticResource QuietButton}"
+                                                    HorizontalOptions="Fill"
+                                                    CommandParameter="{Binding .}"
+                                                    Clicked="OnPriorityClicked"
+                                                    ToolTipProperties.Text="Show urgency calculation" />
+                                            <Label Grid.Column="2"
+                                                   Text="{Binding Title}"
+                                                   TextColor="{StaticResource AccentColor}"
+                                                   TextDecorations="Underline"
+                                                   VerticalOptions="Center"
+                                                   LineBreakMode="TailTruncation"
+                                                   MaxLines="2">
+                                                <Label.GestureRecognizers>
+                                                    <TapGestureRecognizer CommandParameter="{Binding .}"
+                                                                          Tapped="OnTitleTapped" />
+                                                </Label.GestureRecognizers>
+                                            </Label>
+                                            <Label Grid.Column="3"
+                                                   Text="{Binding Author}"
+                                                   VerticalOptions="Center"
+                                                   LineBreakMode="TailTruncation" />
+                                            <Label Grid.Column="4"
+                                                   Text="{Binding AgeText}"
+                                                   VerticalOptions="Center" />
+                                            <Label Grid.Column="5"
+                                                   Text="{Binding ApprovalText}"
+                                                   TextColor="{Binding ApprovalColor}"
+                                                   FontAttributes="Bold"
+                                                   HorizontalTextAlignment="Center"
+                                                   VerticalOptions="Center" />
+                                        </Grid>
+                                        <BoxView Grid.Row="1" Color="#E7E9ED" />
+                                    </Grid>
+                                </DataTemplate>
+                            </CollectionView.ItemTemplate>
+                        </CollectionView>
+
+                        <VerticalStackLayout x:Name="EmptyPanel"
+                                             Padding="24"
+                                             Spacing="10"
+                                             HorizontalOptions="Center"
+                                             VerticalOptions="Center">
+                            <ActivityIndicator x:Name="InitialLoadIndicator"
+                                               WidthRequest="30"
+                                               HeightRequest="30"
+                                               Color="{StaticResource AccentColor}" />
+                            <Label x:Name="EmptyMessageLabel"
+                                   TextColor="{StaticResource MutedColor}"
+                                   HorizontalTextAlignment="Center"
+                                   MaximumWidthRequest="520" />
+                        </VerticalStackLayout>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <ScrollView Grid.Column="1">
+                <VerticalStackLayout Spacing="12">
+                    <Border BackgroundColor="{StaticResource SurfaceColor}"
+                            Stroke="{StaticResource BorderColor}"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 6"
+                            Padding="14">
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="Selected pull request" Style="{StaticResource SectionHeading}" />
+                            <Label x:Name="NoSelectionLabel"
+                                   Text="Select a pull request to inspect it and act on it."
+                                   Style="{StaticResource Caption}" />
+                            <VerticalStackLayout x:Name="SelectedPanel" Spacing="8" IsVisible="False">
+                                <Label x:Name="SelectedIdentityLabel" Style="{StaticResource Caption}" />
+                                <Label x:Name="SelectedTitleLabel"
+                                       FontSize="16"
+                                       FontAttributes="Bold"
+                                       TextColor="{StaticResource AccentColor}"
+                                       TextDecorations="Underline"
+                                       LineBreakMode="WordWrap">
+                                    <Label.GestureRecognizers>
+                                        <TapGestureRecognizer Tapped="OnSelectedTitleTapped" />
+                                    </Label.GestureRecognizers>
+                                </Label>
+                                <Label x:Name="SelectedMetadataLabel" Style="{StaticResource Caption}" />
+                                <Label x:Name="SelectedReviewStateLabel"
+                                       TextColor="{StaticResource WarningColor}"
+                                       FontAttributes="Bold" />
+                                <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="7" RowSpacing="7">
+                                    <Button x:Name="TopButton" Clicked="OnToggleTopClicked" />
+                                    <Button x:Name="IgnoreButton" Grid.Column="1" Clicked="OnToggleIgnoredClicked" />
+                                    <Button x:Name="ReviewNowButton" Grid.Row="1" Grid.ColumnSpan="2" Text="Review now" Clicked="OnReviewNowClicked" />
+                                    <Button x:Name="AcknowledgeButton" Grid.Row="2" Grid.ColumnSpan="2" Text="Move reviewed PR back" Clicked="OnAcknowledgeClicked" />
+                                </Grid>
+                                <BoxView HeightRequest="1" Color="{StaticResource BorderColor}" Margin="0,3" />
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <Label Text="Urgency" FontAttributes="Bold" />
+                                    <Button x:Name="PrioritySummaryButton"
+                                            Grid.Column="1"
+                                            Style="{StaticResource QuietButton}"
+                                            Clicked="OnSelectedPriorityClicked" />
+                                </Grid>
+                                <Label x:Name="PriorityActivityLabel" Style="{StaticResource Caption}" />
+                                <VerticalStackLayout x:Name="PriorityRulesLayout" Spacing="3" />
+                            </VerticalStackLayout>
+                        </VerticalStackLayout>
+                    </Border>
+
+                    <Border BackgroundColor="{StaticResource SurfaceColor}"
+                            Stroke="{StaticResource BorderColor}"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 6"
+                            Padding="14">
+                        <VerticalStackLayout Spacing="9">
+                            <Label Text="Automated review" Style="{StaticResource SectionHeading}" />
+                            <Grid ColumnDefinitions="*,Auto">
+                                <VerticalStackLayout Spacing="1">
+                                    <Label Text="Watcher" FontAttributes="Bold" />
+                                    <Label Text="Track eligible review requests" Style="{StaticResource Caption}" />
+                                </VerticalStackLayout>
+                                <Switch x:Name="ReviewEnabledSwitch"
+                                        Grid.Column="1"
+                                        Toggled="OnReviewEnabledToggled" />
+                            </Grid>
+                            <Grid ColumnDefinitions="*,Auto">
+                                <VerticalStackLayout Spacing="1">
+                                    <Label Text="Send automatically" FontAttributes="Bold" />
+                                    <Label Text="Off keeps review comments in a draft" Style="{StaticResource Caption}" />
+                                </VerticalStackLayout>
+                                <Switch x:Name="AutoSubmitSwitch"
+                                        Grid.Column="1"
+                                        Toggled="OnAutoSubmitToggled" />
+                            </Grid>
+                            <Label x:Name="AgentPipelineLabel" Style="{StaticResource Caption}" />
+                            <Label x:Name="ReviewStatusLabel" LineBreakMode="WordWrap" />
+                            <Label x:Name="ReviewQueueLabel" Style="{StaticResource Caption}" />
+                        </VerticalStackLayout>
+                    </Border>
+
+                    <Border BackgroundColor="{StaticResource SurfaceColor}"
+                            Stroke="{StaticResource BorderColor}"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 6"
+                            Padding="14">
+                        <VerticalStackLayout Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Text="Review pipeline" Style="{StaticResource SectionHeading}" />
+                                <ActivityIndicator x:Name="PipelineIndicator"
+                                                   Grid.Column="1"
+                                                   WidthRequest="20"
+                                                   HeightRequest="20"
+                                                   Color="{StaticResource AccentColor}" />
+                            </Grid>
+                            <Label x:Name="PipelineEmptyLabel"
+                                   Text="No review pipeline has run in this session."
+                                   Style="{StaticResource Caption}" />
+                            <VerticalStackLayout x:Name="PipelinePanel" Spacing="7" IsVisible="False">
+                                <Label x:Name="PipelinePullRequestLabel"
+                                       TextColor="{StaticResource AccentColor}"
+                                       TextDecorations="Underline"
+                                       FontAttributes="Bold">
+                                    <Label.GestureRecognizers>
+                                        <TapGestureRecognizer Tapped="OnPipelinePullRequestTapped" />
+                                    </Label.GestureRecognizers>
+                                </Label>
+                                <Label x:Name="PipelineStatusLabel" />
+                                <VerticalStackLayout x:Name="PipelineStagesLayout" Spacing="6" />
+                            </VerticalStackLayout>
+                        </VerticalStackLayout>
+                    </Border>
+
+                    <Border BackgroundColor="{StaticResource SurfaceColor}"
+                            Stroke="{StaticResource BorderColor}"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 6"
+                            Padding="14">
+                        <VerticalStackLayout Spacing="4">
+                            <Label Text="Operations" Style="{StaticResource SectionHeading}" />
+                            <Label x:Name="CleanupStatusLabel" Style="{StaticResource Caption}" />
+                            <Label x:Name="ErrorLabel"
+                                   TextColor="{StaticResource DangerColor}"
+                                   LineBreakMode="WordWrap" />
+                            <Label x:Name="SettingsPathLabel"
+                                   Style="{StaticResource Caption}"
+                                   LineBreakMode="TailTruncation" />
+                        </VerticalStackLayout>
+                    </Border>
+                </VerticalStackLayout>
+            </ScrollView>
+        </Grid>
+    </Grid>
+</ContentPage>

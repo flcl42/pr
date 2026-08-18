@@ -10,6 +10,7 @@
     <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64</RuntimeIdentifiers>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
@@ -18,11 +19,13 @@
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.55.2" />
     <PackageReference Include="Terminal.Gui" Version="1.19.0" />
+    <PackageReference Include="Porta.Pty" Version="1.0.7" />
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="Contexts\*.md" />
     <Compile Remove="tests\**\*.cs" />
+    <Compile Remove="Pr.Maui\**\*.cs" />
   </ItemGroup>
 
 </Project>
