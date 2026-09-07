@@ -230,7 +230,7 @@ internal static partial class DeepCodeProcessRunner
             }
 
             terminal.Dispose();
-            await Task.Delay(200, CancellationToken.None);
+            await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken.None);
         }
 
         var terminalOutput = StripAnsi(transcript.ToString());
@@ -412,7 +412,8 @@ internal static class DeepCodeSessions
                 return [];
             }
 
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var stream = OpenSharedRead(path);
+            using var document = JsonDocument.Parse(stream);
             if (!document.RootElement.TryGetProperty("entries", out var entries)
                 || entries.ValueKind != JsonValueKind.Array)
             {
@@ -422,6 +423,10 @@ internal static class DeepCodeSessions
             return entries.EnumerateArray().Select(entry => entry.Clone()).ToArray();
         }
         catch (IOException)
+        {
+            return [];
+        }
+        catch (UnauthorizedAccessException)
         {
             return [];
         }
@@ -441,35 +446,58 @@ internal static class DeepCodeSessions
                 return string.Empty;
             }
 
-            foreach (var line in File.ReadLines(path).Reverse())
+            var finalMessage = string.Empty;
+            using var stream = OpenSharedRead(path);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            while (reader.ReadLine() is { } line)
             {
                 if (string.IsNullOrWhiteSpace(line))
                 {
                     continue;
                 }
 
-                using var document = JsonDocument.Parse(line);
-                var root = document.RootElement;
-                if (!string.Equals(ReadString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase))
+                try
                 {
-                    continue;
-                }
+                    using var document = JsonDocument.Parse(line);
+                    var root = document.RootElement;
+                    if (!string.Equals(ReadString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
 
-                var content = ReadString(root, "content");
-                if (!string.IsNullOrWhiteSpace(content))
+                    var content = ReadString(root, "content");
+                    if (!string.IsNullOrWhiteSpace(content))
+                    {
+                        finalMessage = content;
+                    }
+                }
+                catch (JsonException)
                 {
-                    return content;
+                    // The writer may still be appending the final JSONL record.
                 }
             }
+
+            return finalMessage;
         }
         catch (IOException)
         {
         }
-        catch (JsonException)
+        catch (UnauthorizedAccessException)
         {
         }
 
         return string.Empty;
+    }
+
+    internal static FileStream OpenSharedRead(string path)
+    {
+        return new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4_096,
+            FileOptions.SequentialScan);
     }
 
     private static string? ReadString(JsonElement element, string propertyName)

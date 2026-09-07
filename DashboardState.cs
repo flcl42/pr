@@ -21,6 +21,7 @@ internal sealed record DashboardSnapshot(
     bool CanCleanup,
     CodexReviewSnapshot Review,
     CodexReviewSettings ReviewSettings,
+    IReadOnlyList<JournalOperation> Journal,
     string SettingsPath);
 
 internal sealed record DashboardPullRequest(

@@ -7,12 +7,13 @@ public partial class MainPage : ContentPage
 {
     private readonly DashboardApp _dashboard;
     private readonly CancellationTokenSource _shutdown = new();
-    private readonly IDispatcherTimer _elapsedTimer;
+    private readonly Dictionary<ReviewAgent, ReviewAgentEditor> _reviewAgentEditors = [];
     private DashboardSnapshot? _snapshot;
     private Task? _backendTask;
     private PullRequestRow? _selected;
     private string? _selectedKey;
     private string _listFingerprint = string.Empty;
+    private string _journalFingerprint = string.Empty;
     private string? _backendError;
     private int _refreshQueued;
     private bool _started;
@@ -22,10 +23,9 @@ public partial class MainPage : ContentPage
     {
         InitializeComponent();
         _dashboard = new DashboardApp(settings);
-        _elapsedTimer = Dispatcher.CreateTimer();
-        _elapsedTimer.Interval = TimeSpan.FromSeconds(1);
-        _elapsedTimer.Tick += OnElapsedTimerTick;
+        BuildReviewAgentEditors();
         ApplySnapshot(_dashboard.GetSnapshot());
+        _ = LoadReviewModelsAsync();
     }
 
     protected override void OnAppearing()
@@ -37,13 +37,11 @@ public partial class MainPage : ContentPage
         }
 
         _started = true;
-        _elapsedTimer.Start();
         _backendTask = Task.Run(RunBackendAsync);
     }
 
     public void Stop()
     {
-        _elapsedTimer.Stop();
         _shutdown.Cancel();
     }
 
@@ -120,7 +118,7 @@ public partial class MainPage : ContentPage
 
         UpdatePullRequestList(snapshot);
         UpdateReviewPanel(snapshot);
-        UpdatePipeline(snapshot.Review.PipelineProgress);
+        UpdateJournal(snapshot.Journal);
         UpdateOperations(snapshot);
     }
 
@@ -236,6 +234,14 @@ public partial class MainPage : ContentPage
 
     private void UpdateReviewPanel(DashboardSnapshot snapshot)
     {
+        foreach (var agent in snapshot.ReviewSettings.AvailableAgents)
+        {
+            if (_reviewAgentEditors.TryGetValue(agent.Agent, out var editor))
+            {
+                editor.Update(agent);
+            }
+        }
+
         var agents = snapshot.ReviewSettings.EnabledAgents;
         AgentPipelineLabel.Text = agents.Count == 0
             ? "No agents enabled in .pr.yml"
@@ -245,108 +251,154 @@ public partial class MainPage : ContentPage
         ReviewQueueLabel.Text = $"{snapshot.Review.WaitingCount.ToString(CultureInfo.InvariantCulture)} waiting  |  {snapshot.Review.ManualQueueCount.ToString(CultureInfo.InvariantCulture)} manually queued";
     }
 
-    private void UpdatePipeline(ReviewPipelineProgress? progress)
+    private void BuildReviewAgentEditors()
     {
-        PipelineEmptyLabel.IsVisible = progress is null;
-        PipelinePanel.IsVisible = progress is not null;
-        PipelineIndicator.IsRunning = progress?.Status == ReviewPipelineStatus.Running;
-        PipelineIndicator.IsVisible = PipelineIndicator.IsRunning;
-        PipelineStagesLayout.Children.Clear();
-        if (progress is null)
+        ReviewAgentOptionsLayout.Children.Clear();
+        foreach (var agent in _dashboard.ReviewAgents)
+        {
+            var editor = new ReviewAgentEditor(this, agent);
+            editor.Changed += OnReviewAgentChanged;
+            _reviewAgentEditors[agent.Agent] = editor;
+            ReviewAgentOptionsLayout.Children.Add(editor.View);
+        }
+    }
+
+    private async Task LoadReviewModelsAsync()
+    {
+        await Task.WhenAll(_reviewAgentEditors.Values.Select(editor => editor.LoadModelsAsync()));
+    }
+
+    private void OnReviewAgentChanged(object? sender, EventArgs args)
+    {
+        if (_updatingControls)
         {
             return;
         }
 
-        PipelinePullRequestLabel.Text = $"{progress.Repository} #{progress.PullRequestNumber.ToString(CultureInfo.InvariantCulture)}  {progress.PullRequestTitle}";
-        var elapsed = (progress.CompletedAt ?? DateTimeOffset.UtcNow) - progress.StartedAt;
-        var mode = progress.IsManual ? "manual" : "automatic";
-        var status = progress.Status == ReviewPipelineStatus.Running
-            && progress.Stages.All(stage => stage.Status == ReviewAgentStageStatus.Pending)
-                ? "Preparing workspace"
-                : PipelineStatusText(progress.Status);
-        PipelineStatusLabel.Text = $"{status}  |  {mode}  |  {FormatDuration(elapsed)}  |  {progress.FindingCount.ToString(CultureInfo.InvariantCulture)} finding(s)";
-        PipelineStatusLabel.TextColor = UiColors.ForPipeline(progress.Status);
-        if (!string.IsNullOrWhiteSpace(progress.Detail))
+        _dashboard.SetCodexReviewAgents(_reviewAgentEditors.Values
+            .Select(editor => editor.Settings)
+            .ToArray());
+        QueueSnapshotRefresh();
+    }
+
+    private void UpdateJournal(IReadOnlyList<JournalOperation> operations)
+    {
+        JournalIndicator.IsRunning = operations.Any(operation => operation.Status == JournalOperationStatus.Running);
+        JournalIndicator.IsVisible = JournalIndicator.IsRunning;
+        JournalEmptyLabel.IsVisible = operations.Count == 0;
+        var fingerprint = string.Join(
+            '\n',
+            operations.Select(operation => string.Join(
+                '|',
+                operation.Id,
+                operation.Status,
+                operation.CompletedAt?.UtcTicks,
+                string.Join(',', operation.Steps.Select(step =>
+                    $"{step.Key}:{step.Status}:{step.Detail}:{step.StartedAt?.UtcTicks}:{step.CompletedAt?.UtcTicks}")))));
+        if (string.Equals(fingerprint, _journalFingerprint, StringComparison.Ordinal))
         {
-            PipelineStagesLayout.Children.Add(new Label
-            {
-                Text = progress.Detail,
-                TextColor = UiColors.Muted,
-                FontSize = 12,
-            });
+            return;
         }
 
-        foreach (var stage in progress.Stages.OrderBy(stage => stage.Index))
+        _journalFingerprint = fingerprint;
+        JournalEntriesLayout.Children.Clear();
+        for (var index = 0; index < operations.Count; index++)
         {
-            PipelineStagesLayout.Children.Add(CreateStageView(stage));
+            JournalEntriesLayout.Children.Add(CreateJournalOperationView(operations[index], index == operations.Count - 1));
         }
     }
 
-    private static View CreateStageView(ReviewStageProgress stage)
+    private static View CreateJournalOperationView(JournalOperation operation, bool isLast)
     {
-        var statusColor = UiColors.ForStage(stage.Status);
-        var model = string.IsNullOrWhiteSpace(stage.Effort)
-            ? stage.Model
-            : $"{stage.Model} / {stage.Effort}";
-        var elapsed = stage.StartedAt is null
-            ? string.Empty
-            : "  |  " + FormatDuration((stage.CompletedAt ?? DateTimeOffset.UtcNow) - stage.StartedAt.Value);
-        var result = stage.Status == ReviewAgentStageStatus.Completed
-            ? $"{stage.ReturnedFindings.ToString(CultureInfo.InvariantCulture)} returned, {stage.AcceptedFindings.ToString(CultureInfo.InvariantCulture)} added"
-            : stage.Status is ReviewAgentStageStatus.Failed or ReviewAgentStageStatus.Canceled
-                ? stage.Error ?? StageStatusText(stage.Status)
-                : stage.Status == ReviewAgentStageStatus.Running
-                    ? "Inspecting the pull request"
-                    : "Waiting for the previous stage";
+        var statusColor = UiColors.ForJournal(operation.Status);
+        var title = new Label
+        {
+            Text = operation.Title,
+            FontAttributes = FontAttributes.Bold,
+            FontSize = 14,
+            LineBreakMode = LineBreakMode.WordWrap,
+        };
+        if (!string.IsNullOrWhiteSpace(operation.Url))
+        {
+            title.TextColor = UiColors.Accent;
+            title.TextDecorations = TextDecorations.Underline;
+            var open = new TapGestureRecognizer();
+            open.Tapped += (_, _) => PullRequests.OpenUrl(operation.Url);
+            title.GestureRecognizers.Add(open);
+        }
 
-        var grid = new Grid
+        var header = new Grid
         {
             ColumnDefinitions =
             {
                 new ColumnDefinition(GridLength.Star),
                 new ColumnDefinition(GridLength.Auto),
             },
-            RowDefinitions =
-            {
-                new RowDefinition(GridLength.Auto),
-                new RowDefinition(GridLength.Auto),
-                new RowDefinition(1),
-            },
             ColumnSpacing = 8,
-            RowSpacing = 2,
         };
-        var name = new Label
-        {
-            Text = $"{stage.Index.ToString(CultureInfo.InvariantCulture)}. {stage.DisplayName}",
-            FontAttributes = FontAttributes.Bold,
-            FontSize = 13,
-        };
+        header.Children.Add(title);
         var status = new Label
         {
-            Text = StageStatusText(stage.Status) + elapsed,
+            Text = JournalStatusText(operation.Status),
             TextColor = statusColor,
             FontAttributes = FontAttributes.Bold,
             FontSize = 12,
             HorizontalTextAlignment = TextAlignment.End,
         };
         Grid.SetColumn(status, 1);
-        var detail = new Label
+        header.Children.Add(status);
+
+        var metadata = operation.CompletedAt is null
+            ? $"Started {operation.StartedAt.LocalDateTime:MMM d HH:mm:ss}"
+            : $"{operation.StartedAt.LocalDateTime:MMM d HH:mm:ss}  |  {TimelineView.FormatDuration(operation.CompletedAt.Value - operation.StartedAt)}";
+        var details = new VerticalStackLayout
         {
-            Text = $"{model}  |  {result}",
-            TextColor = stage.Status == ReviewAgentStageStatus.Failed ? UiColors.Danger : UiColors.Muted,
-            FontSize = 12,
-            LineBreakMode = LineBreakMode.WordWrap,
+            Spacing = 1,
+            Children =
+            {
+                new Label
+                {
+                    Text = operation.Subtitle,
+                    IsVisible = !string.IsNullOrWhiteSpace(operation.Subtitle),
+                    TextColor = UiColors.Muted,
+                    FontSize = 12,
+                    LineBreakMode = LineBreakMode.WordWrap,
+                    MaxLines = 2,
+                },
+                new Label
+                {
+                    Text = metadata,
+                    TextColor = UiColors.MutedLight,
+                    FontSize = 11,
+                },
+            },
         };
-        Grid.SetRow(detail, 1);
-        Grid.SetColumnSpan(detail, 2);
-        var divider = new BoxView { Color = UiColors.Border, HeightRequest = 1, Margin = new Thickness(0, 4, 0, 0) };
-        Grid.SetRow(divider, 2);
-        Grid.SetColumnSpan(divider, 2);
-        grid.Children.Add(name);
-        grid.Children.Add(status);
-        grid.Children.Add(detail);
-        grid.Children.Add(divider);
-        return grid;
+        var timeline = new VerticalStackLayout { Spacing = 0, Margin = new Thickness(0, 5, 0, 0) };
+        for (var index = 0; index < operation.Steps.Count; index++)
+        {
+            timeline.Children.Add(TimelineView.CreateStep(
+                operation.Steps[index],
+                isFirst: index == 0,
+                isLast: index == operation.Steps.Count - 1));
+        }
+
+        return new VerticalStackLayout
+        {
+            Spacing = 3,
+            Children =
+            {
+                header,
+                details,
+                timeline,
+                new BoxView
+                {
+                    Color = UiColors.Border,
+                    HeightRequest = isLast ? 0 : 1,
+                    IsVisible = !isLast,
+                    Margin = new Thickness(0, 5, 0, 0),
+                },
+            },
+        };
     }
 
     private void UpdateOperations(DashboardSnapshot snapshot)
@@ -360,14 +412,6 @@ public partial class MainPage : ContentPage
         ErrorLabel.IsVisible = ErrorLabel.Text.Length > 0;
         SettingsPathLabel.Text = "Settings: " + snapshot.SettingsPath;
         ToolTipProperties.SetText(SettingsPathLabel, snapshot.SettingsPath);
-    }
-
-    private void OnElapsedTimerTick(object? sender, EventArgs args)
-    {
-        if (_snapshot?.Review.PipelineProgress?.Status == ReviewPipelineStatus.Running)
-        {
-            UpdatePipeline(_snapshot.Review.PipelineProgress);
-        }
     }
 
     private void OnSearchTextChanged(object? sender, TextChangedEventArgs args)
@@ -445,6 +489,11 @@ public partial class MainPage : ContentPage
         {
             await DisplayAlertAsync("Track repository", ex.Message, "Close");
         }
+    }
+
+    private async void OnLocalReviewClicked(object? sender, EventArgs args)
+    {
+        await Navigation.PushModalAsync(new LocalReviewPage(_dashboard, _shutdown.Token));
     }
 
     private void OnShowIgnoredToggled(object? sender, ToggledEventArgs args)
@@ -566,15 +615,6 @@ public partial class MainPage : ContentPage
         }
     }
 
-    private void OnPipelinePullRequestTapped(object? sender, TappedEventArgs args)
-    {
-        var url = _snapshot?.Review.PipelineProgress?.PullRequestUrl;
-        if (!string.IsNullOrWhiteSpace(url))
-        {
-            PullRequests.OpenUrl(url);
-        }
-    }
-
     internal static void PopulatePriorityRules(
         Layout layout,
         PullRequestPriority priority,
@@ -622,31 +662,14 @@ public partial class MainPage : ContentPage
         }
     }
 
-    private static string PipelineStatusText(ReviewPipelineStatus status) => status switch
+    private static string JournalStatusText(JournalOperationStatus status) => status switch
     {
-        ReviewPipelineStatus.CompletedWithErrors => "Completed with agent errors",
-        ReviewPipelineStatus.Completed => "Completed",
-        ReviewPipelineStatus.Failed => "Failed",
-        ReviewPipelineStatus.Canceled => "Canceled",
+        JournalOperationStatus.CompletedWithErrors => "Completed with errors",
+        JournalOperationStatus.Completed => "Completed",
+        JournalOperationStatus.Failed => "Failed",
+        JournalOperationStatus.Canceled => "Canceled",
         _ => "Running",
     };
-
-    private static string StageStatusText(ReviewAgentStageStatus status) => status switch
-    {
-        ReviewAgentStageStatus.Completed => "Completed",
-        ReviewAgentStageStatus.Failed => "Failed",
-        ReviewAgentStageStatus.Canceled => "Canceled",
-        ReviewAgentStageStatus.Running => "Running",
-        _ => "Pending",
-    };
-
-    private static string FormatDuration(TimeSpan duration)
-    {
-        duration = duration < TimeSpan.Zero ? TimeSpan.Zero : duration;
-        return duration.TotalHours >= 1
-            ? $"{(int)duration.TotalHours}:{duration.Minutes:00}:{duration.Seconds:00}"
-            : $"{duration.Minutes}:{duration.Seconds:00}";
-    }
 }
 
 internal sealed class PullRequestGroup : List<PullRequestRow>
@@ -842,6 +865,7 @@ internal sealed class WeeklyStatsPage : ContentPage
 internal static class UiColors
 {
     public static Color Canvas { get; } = Color.FromArgb("#F4F5F7");
+    public static Color Surface { get; } = Color.FromArgb("#FFFFFF");
     public static Color Border { get; } = Color.FromArgb("#D5D9E0");
     public static Color Accent { get; } = Color.FromArgb("#0969DA");
     public static Color Success { get; } = Color.FromArgb("#1A7F37");
@@ -877,6 +901,24 @@ internal static class UiColors
         ReviewAgentStageStatus.Running => Accent,
         _ => Muted,
     };
+
+    public static Color ForJournal(JournalOperationStatus status) => status switch
+    {
+        JournalOperationStatus.Completed => Success,
+        JournalOperationStatus.CompletedWithErrors => Warning,
+        JournalOperationStatus.Failed => Danger,
+        JournalOperationStatus.Canceled => Muted,
+        _ => Accent,
+    };
+
+    public static Color ForJournalStep(JournalStepStatus status) => status switch
+    {
+        JournalStepStatus.Completed => Success,
+        JournalStepStatus.Failed => Danger,
+        JournalStepStatus.Canceled => MutedLight,
+        JournalStepStatus.Running => Accent,
+        _ => MutedLight,
+    };
 }
 
 internal static class GridPositionExtensions
@@ -885,6 +927,13 @@ internal static class GridPositionExtensions
         where T : BindableObject
     {
         Grid.SetRow(view, row);
+        return view;
+    }
+
+    public static T AtGridColumn<T>(this T view, int column)
+        where T : BindableObject
+    {
+        Grid.SetColumn(view, column);
         return view;
     }
 }

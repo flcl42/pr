@@ -1,8 +1,8 @@
 # pr
 
-Compact GitHub PR dashboard, opener, notification cleaner, and optional
-collaborative review watcher using Codex, Claude, Kimi, and DeepSeek through
-Deep Code.
+Compact GitHub PR dashboard, opener, notification cleaner, local project
+reviewer, and optional collaborative PR review watcher using Codex, Claude,
+Kimi, DeepSeek through Deep Code, and OpenCode.
 
 ## Install
 
@@ -11,8 +11,8 @@ optional Windows desktop companion is a self-contained zip installed beside
 the CLI. The app uses `GH_TOKEN` or `GITHUB_TOKEN` when set, otherwise it reads
 the active token from `gh auth token`, so install and authenticate GitHub CLI
 first with `gh auth login`. Automatic PR review also requires each enabled
-`codex`, `claude`, `kimi`, or `deepcode` CLI on `PATH`; the reviewer is disabled
-by default.
+`codex`, `claude`, `kimi`, `deepcode`, or `opencode` CLI on `PATH`; the reviewer
+is disabled by default.
 
 Linux, bash:
 
@@ -64,11 +64,19 @@ shows the add command instead of exiting.
 the CLI. It provides the grouped Reviewed, Top, and regular PR table; interactive
 search; urgency breakdowns; repository addition; refresh and notification
 cleanup; weekly stats; ignore and Top actions; manual review queueing; review
-enablement and delivery controls; and live status for every configured agent
-stage. PR titles open GitHub, while PR numbers open the urgency calculation.
+enablement and delivery controls; per-agent checkboxes plus model and effort
+selectors; and a persistent activity journal. Refreshes, cleanup runs, and each
+PR review are separate journal groups. Review groups show eligibility, worktree
+preparation, every configured agent, the final activity check, and GitHub
+publication as connected steps. The latest 30 operations are stored in
+`journal.json` under `codexReview.dataDirectory`. PR agent, model, and effort
+choices are saved to `.pr.yml`. Its Local review page saves project directories,
+accepts typed paths or a native folder picker, provides per-run agent, model,
+and effort choices, and shows the same connected-step timeline. PR titles
+open GitHub, while PR numbers open the urgency calculation.
 Reviewed titles start with the agents that completed successfully: `C` for
-Codex, `c` for Claude, `K` for Kimi, and `D` for DeepSeek. Failed agents are
-omitted, so `[CcK]` means those three stages completed.
+Codex, `c` for Claude, `K` for Kimi, `D` for DeepSeek, and `O` for OpenCode.
+Failed agents are omitted, so `[CcK]` means those three stages completed.
 
 The default solution deliberately excludes MAUI and needs only the .NET SDK:
 
@@ -88,6 +96,46 @@ dotnet publish Pr.Maui/Pr.Maui.csproj -c Release -r win-x64 --self-contained tru
 For a development output in another location, set `PR_UI_PATH` to the full
 `pr-ui.exe` path. The launcher passes the CLI settings path through
 `PR_SETTINGS_PATH`, so the companion never creates a separate configuration.
+
+### Local directory review
+
+Open **Local review** in the Windows desktop companion, add or select a project
+directory, choose any combination of Codex, Claude, Kimi, Deep Code, and
+OpenCode, select their models, and press **Review it**. Local selections apply
+only to that run; they do not change the automatic PR review pipeline. The
+selected agents run in order against a disposable Git
+snapshot. For a Git repository root, the review scope is the branch diff against
+the default branch plus staged, unstaged, and untracked changes. A non-Git
+directory remains a complete-project review. Agents may modify and test the
+snapshot, and it is reset to the original snapshot commit after every agent.
+Different project directories can be reviewed concurrently; a second review of
+the same directory is rejected until its current run finishes.
+
+The selected source is not used as an agent worktree. The only file written to
+it is `pr-review.md` in the selected top-level directory after the pipeline
+finishes. That report contains the combined, deduplicated, severity-ordered
+issues, agent status, and failures. An all-agent failure also produces a report
+with the failure state. The previous `pr-review.md` is excluded from later
+snapshots. Per-directory progress and the latest result are persisted in
+`local-review-state.json` under `codexReview.dataDirectory`. Selecting a saved
+directory restores that state after reopening the app; a run interrupted by an
+app stop is shown as interrupted rather than silently discarded.
+
+For a Git working tree, the snapshot includes tracked files and untracked files
+that are not ignored by Git, while unchanged files are available only as review
+context. For a non-Git directory, it skips conventional
+VCS, dependency, build, coverage, and IDE-output directories. Symbolic links and
+reparse points are not followed. Temporary worktrees use
+`codexReview.workspaceDirectory`; prompts, results, logs, and the collaborative
+ledger use `codexReview.dataDirectory`.
+
+Local project context can use the selected directory name or its absolute path
+as a key under `codexReview.contexts`. A `<directory-name>.md` file in
+`contextDirectory` is the fallback. `maxFindings`, per-agent model, effort,
+command, timeout, and sandbox are shared with PR reviews. The configured enabled
+states provide the initial checkbox selection and can be
+overridden for each local run. The watcher's top-level `enabled` switch is not
+required for an explicitly started local review.
 
 Passing a PR number opens it in the default browser. Bare PR numbers work when a
 single repository is tracked. With multiple repositories, use `OWNER/REPO#NUMBER`
@@ -216,6 +264,8 @@ Settings are stored next to the executable in `.pr.yml`:
 requiredApprovals: 2
 repositories:
   - https://github.com/OWNER/REPO
+localReviewDirectories:
+  - C:\src\project
 topPullRequests:
   - https://github.com/OWNER/REPO/pull/10844
 ignoredPullRequests:
@@ -242,6 +292,7 @@ priority:
     - kimi
     - deepseek
     - deepcode
+    - opencode
     - copilot
 codexReview:
   enabled: false
@@ -266,6 +317,8 @@ codexReview:
       enabled: false
       model: deepseek-v4-pro
       effort: max
+    opencode:
+      enabled: false
   sandbox: workspace-write
   ephemeral: true
   ignoreUserConfig: true
@@ -294,6 +347,7 @@ codexReview:
     - kimi
     - deepseek
     - deepcode
+    - opencode
     - copilot
 ```
 
@@ -320,19 +374,32 @@ accepts `enabled`, `model`, `effort`, and an optional `command` override. Omit
 `reasoningEffort`, and `command` settings remain readable and are migrated to a
 single enabled pipeline entry the next time settings are saved.
 
-Codex receives `model` and `effort` through its CLI and uses the global
-`sandbox`, whose default is `workspace-write`. Claude receives both values,
+Codex receives `model` and `effort` through its CLI. The default
+`workspace-write` policy uses Codex's automatically reviewed approval mode so
+local inspection, temporary edits, and tests can run without prompts;
+`danger-full-access` uses Codex's explicit sandbox bypass and should be selected
+only for disposable, trusted worktrees. With `ignoreUserConfig: true`, Codex
+also ignores external execution-policy rules. Claude receives both values,
 runs in `auto` permission mode, and exposes only local read, search, shell,
 edit, and write tools. Kimi receives `model`, but its CLI does not expose an
-effort control; any configured Kimi effort is ignored. It runs with `--auto`
-and an explicit profile exposing `Read`, `Grep`, `Glob`, `Write`, `Edit`, and
-`Bash`, plus a pre-generated PR diff. DeepSeek runs through the `deepcode` CLI
+effort control; any configured Kimi effort is ignored. Its non-interactive
+prompt mode applies Kimi's automatic permission policy implicitly, with an
+explicit profile exposing `Read`, `Grep`, `Glob`, `Write`, `Edit`, and `Bash`,
+plus a pre-generated scope manifest. DeepSeek runs through the `deepcode` CLI
 in a cross-platform pseudo terminal because Deep Code requires a TTY. Deep Code
 receives the model through `DEEPCODE_MODEL`; its effort may be `high` or `max`
 and is passed through `DEEPCODE_REASONING_EFFORT`. A temporary project policy
 allows reads, writes, deletion, tests, and Git inspection inside the worktree
 while denying access outside it, network access, MCP, and Git-history mutation.
-The original project policy is restored after the stage.
+The original project policy is restored after the stage. OpenCode runs through
+`opencode run --format json --auto`; `model` maps to `--model`, `effort` maps to
+`--variant`, and omitted values use OpenCode's configured defaults. With
+`ignoreUserConfig: true`, external OpenCode plugins are disabled through
+`--pure` while its built-in local editing and shell tools remain available.
+OpenCode data, cache, and state are kept under `workspaceDirectory/opencode`
+instead of the system drive. Its own Git snapshots are disabled because the
+review coordinator already creates and resets a disposable worktree for every
+agent stage.
 
 Each agent returns the same `summary` plus `findings` JSON object. The
 coordinator validates the schema and diff anchors, removes exact repeated

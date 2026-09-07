@@ -269,7 +269,9 @@ internal sealed class DashboardApp
     private readonly int _requiredApprovals;
     private readonly string _settingsPath;
     private readonly GhClient _client = new();
+    private readonly DashboardActivityJournal _activityJournal;
     private readonly CodexReviewWatcher _codexReviewWatcher;
+    private readonly LocalReviewCoordinator _localReviewCoordinator;
     private IReadOnlyList<PullRequestInfo> _items = [];
     private IReadOnlyDictionary<string, PullRequestInfo> _recentlyAcknowledgedCodexPullRequests
         = new Dictionary<string, PullRequestInfo>(StringComparer.OrdinalIgnoreCase);
@@ -312,6 +314,7 @@ internal sealed class DashboardApp
         _ignoredPullRequestCount = settings.IgnoredPullRequests.Count;
         _settingsLastWriteUtc = GetSettingsLastWriteUtc();
         _nextCleanup = DateTimeOffset.UtcNow.AddSeconds(20);
+        _activityJournal = new DashboardActivityJournal(_settingsPath, settings.CodexReview);
         _codexReviewWatcher = new CodexReviewWatcher(
             _repositories,
             _settingsPath,
@@ -319,6 +322,10 @@ internal sealed class DashboardApp
             () => _ignoredPullRequestKeys,
             ApplyCodexReviewSnapshot);
         _codexReviewSnapshot = _codexReviewWatcher.Snapshot;
+        _localReviewCoordinator = new LocalReviewCoordinator(
+            _settingsPath,
+            settings.CodexReview,
+            NotifyExternalStateChanged);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -396,6 +403,8 @@ internal sealed class DashboardApp
         Task<FetchResult>? priorityRefresh = null;
         Task<CleanupResult>? cleanup = null;
         var refreshIsFirstPageOnly = false;
+        string? refreshJournalId = null;
+        string? cleanupJournalId = null;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -417,6 +426,21 @@ internal sealed class DashboardApp
             if (refresh is null && priorityRefresh is null && DateTimeOffset.UtcNow >= _nextRefresh)
             {
                 var firstPaintOnly = _lastRefresh is null;
+                refreshJournalId = _activityJournal.Start(
+                    JournalOperationKind.Refresh,
+                    "Refresh pull requests",
+                    _repositories.Count == 1
+                        ? _repositories[0].FullName
+                        : $"{_repositories.Count.ToString(CultureInfo.InvariantCulture)} tracked repositories",
+                    [
+                        ("fetch", "Query GitHub"),
+                        ("priority", "Calculate urgency"),
+                        ("apply", "Apply dashboard update"),
+                    ],
+                    firstStepKey: "fetch",
+                    firstStepDetail: firstPaintOnly
+                        ? "Loading the first page for a fast initial view"
+                        : "Loading open pull requests");
                 refresh = _client.FetchPullRequestsAsync(
                     _repositories,
                     _requiredApprovals,
@@ -436,6 +460,16 @@ internal sealed class DashboardApp
                 && cleanup is null
                 && DateTimeOffset.UtcNow >= _nextCleanup)
             {
+                cleanupJournalId = _activityJournal.Start(
+                    JournalOperationKind.Cleanup,
+                    "Clean notifications and saved PRs",
+                    null,
+                    [
+                        ("scan", "Scan GitHub notifications"),
+                        ("apply", "Update saved PR state"),
+                    ],
+                    firstStepKey: "scan",
+                    firstStepDetail: "Checking tracked repositories");
                 cleanup = new NotificationCleaner(
                     _repositories,
                     _settings.IgnoredPullRequests,
@@ -457,6 +491,11 @@ internal sealed class DashboardApp
                     ApplyFetchResult(result, dingOnNewItems: !result.IsPartial, preserveExistingPriorities: true);
                     if (result.IsPartial && wasFirstPageOnly)
                     {
+                        _activityJournal.UpdateStep(
+                            refreshJournalId,
+                            "fetch",
+                            JournalStepStatus.Running,
+                            $"First page loaded; fetching the remaining {result.OpenNonDraftCount.ToString(CultureInfo.InvariantCulture)} open pull request(s)");
                         refresh = _client.FetchPullRequestsAsync(
                             _repositories,
                             _requiredApprovals,
@@ -469,6 +508,16 @@ internal sealed class DashboardApp
                     }
                     else
                     {
+                        _activityJournal.UpdateStep(
+                            refreshJournalId,
+                            "fetch",
+                            JournalStepStatus.Completed,
+                            $"Loaded {result.OpenNonDraftCount.ToString(CultureInfo.InvariantCulture)} open pull request(s) with {result.ApiCalls.ToString(CultureInfo.InvariantCulture)} GitHub request(s)");
+                        _activityJournal.UpdateStep(
+                            refreshJournalId,
+                            "priority",
+                            JournalStepStatus.Running,
+                            "Loading discussion and review activity without blocking the table");
                         priorityRefresh = _client.EnrichPullRequestPrioritiesAsync(
                             new FetchResult(_items, _openNonDraftCount, _apiCalls, _repositories.Count, _currentUserLogin, IsPartial: false),
                             _settings.Priority,
@@ -481,6 +530,13 @@ internal sealed class DashboardApp
                 {
                     _error = ex.Message;
                     _nextRefresh = DateTimeOffset.UtcNow.Add(FailedRefreshRetryInterval);
+                    _activityJournal.UpdateStep(
+                        refreshJournalId,
+                        "fetch",
+                        JournalStepStatus.Failed,
+                        ex.Message);
+                    _activityJournal.Finish(refreshJournalId, JournalOperationStatus.Failed);
+                    refreshJournalId = null;
                     refresh = null;
                     refreshIsFirstPageOnly = false;
                 }
@@ -490,33 +546,98 @@ internal sealed class DashboardApp
 
             if (priorityRefresh is not null && priorityRefresh.IsCompleted)
             {
+                var priorityLoaded = false;
                 try
                 {
-                    ApplyFetchResult(await priorityRefresh, dingOnNewItems: false, updateSuccessfulPriorities: true);
+                    var result = await priorityRefresh;
+                    _activityJournal.UpdateStep(
+                        refreshJournalId,
+                        "priority",
+                        JournalStepStatus.Completed,
+                        $"Urgency updated for {result.Items.Count.ToString(CultureInfo.InvariantCulture)} pull request(s)");
+                    priorityLoaded = true;
+                    _activityJournal.UpdateStep(
+                        refreshJournalId,
+                        "apply",
+                        JournalStepStatus.Running,
+                        "Publishing the completed snapshot");
+                    ApplyFetchResult(result, dingOnNewItems: false, updateSuccessfulPriorities: true);
+                    _activityJournal.UpdateStep(
+                        refreshJournalId,
+                        "apply",
+                        JournalStepStatus.Completed,
+                        "Dashboard is up to date");
+                    _activityJournal.Finish(refreshJournalId, JournalOperationStatus.Completed);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _error = $"priority refresh failed: {ex.Message}";
                     _nextRefresh = DateTimeOffset.UtcNow.Add(FailedRefreshRetryInterval);
+                    _activityJournal.UpdateStep(
+                        refreshJournalId,
+                        priorityLoaded ? "apply" : "priority",
+                        JournalStepStatus.Failed,
+                        ex.Message);
+                    if (!priorityLoaded)
+                    {
+                        _activityJournal.UpdateStep(
+                            refreshJournalId,
+                            "apply",
+                            JournalStepStatus.Completed,
+                            "Kept the last successful urgency values");
+                    }
+
+                    _activityJournal.Finish(
+                        refreshJournalId,
+                        priorityLoaded
+                            ? JournalOperationStatus.Failed
+                            : JournalOperationStatus.CompletedWithErrors);
                 }
 
                 priorityRefresh = null;
+                refreshJournalId = null;
                 PublishStateChanged(stateChanged, refresh is not null, cleanup is not null);
             }
 
             if (cleanup is not null && cleanup.IsCompleted)
             {
+                var scanCompleted = false;
                 try
                 {
-                    ApplyCleanupResult(await cleanup);
+                    var result = await cleanup;
+                    _activityJournal.UpdateStep(
+                        cleanupJournalId,
+                        "scan",
+                        JournalStepStatus.Completed,
+                        $"Scanned {result.Scanned.ToString(CultureInfo.InvariantCulture)} notification(s); marked {result.MarkedRead.ToString(CultureInfo.InvariantCulture)} read");
+                    scanCompleted = true;
+                    _activityJournal.UpdateStep(
+                        cleanupJournalId,
+                        "apply",
+                        JournalStepStatus.Running,
+                        "Removing closed ignored and Top entries");
+                    ApplyCleanupResult(result);
+                    _activityJournal.UpdateStep(
+                        cleanupJournalId,
+                        "apply",
+                        JournalStepStatus.Completed,
+                        $"Removed {result.RemovedIgnoredPullRequests.Count.ToString(CultureInfo.InvariantCulture)} ignored and {result.RemovedTopPullRequests.Count.ToString(CultureInfo.InvariantCulture)} Top entry or entries");
+                    _activityJournal.Finish(cleanupJournalId, JournalOperationStatus.Completed);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _cleanupError = ex.Message;
                     _nextCleanup = DateTimeOffset.UtcNow.Add(FailedCleanupRetryInterval);
+                    _activityJournal.UpdateStep(
+                        cleanupJournalId,
+                        scanCompleted ? "apply" : "scan",
+                        JournalStepStatus.Failed,
+                        ex.Message);
+                    _activityJournal.Finish(cleanupJournalId, JournalOperationStatus.Failed);
                 }
 
                 cleanup = null;
+                cleanupJournalId = null;
                 PublishStateChanged(stateChanged, refresh is not null || priorityRefresh is not null, isCleaning: false);
             }
 
@@ -699,6 +820,11 @@ internal sealed class DashboardApp
             changed = true;
         }
 
+        if (_settings.ReplaceLocalReviewDirectories(latest.LocalReviewDirectories))
+        {
+            changed = true;
+        }
+
         if (_settings.ReplaceCodexReview(latest.CodexReview))
         {
             _codexReviewWatcher.Wake();
@@ -797,6 +923,7 @@ internal sealed class DashboardApp
             CanCleanup: CanCleanup(),
             Review: _codexReviewSnapshot,
             ReviewSettings: _settings.CodexReview,
+            Journal: _activityJournal.Snapshot(),
             SettingsPath: _settingsPath);
     }
 
@@ -944,6 +1071,27 @@ internal sealed class DashboardApp
         return true;
     }
 
+    internal bool SetCodexReviewAgents(IReadOnlyCollection<ReviewAgentSettings> agents)
+    {
+        var settings = _settings.CodexReview.WithAgents(agents);
+        if (!_settings.ReplaceCodexReview(settings))
+        {
+            return false;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _codexReviewSnapshot = _codexReviewSnapshot with
+        {
+            Message = settings.EnabledAgents.Count == 0
+                ? "Review pipeline has no enabled agents"
+                : $"{settings.AgentDescriptor} pipeline updated",
+        };
+        _codexReviewWatcher.Wake();
+        NotifyExternalStateChanged();
+        return true;
+    }
+
     internal bool AcknowledgeCodexReview(PullRequestInfo pullRequest)
     {
         if (!_codexReviewWatcher.Acknowledge(pullRequest.Key))
@@ -973,6 +1121,7 @@ internal sealed class DashboardApp
 
     private void ApplyCodexReviewSnapshot(CodexReviewSnapshot snapshot)
     {
+        _activityJournal.ObserveReview(snapshot.PipelineProgress);
         _codexReviewSnapshot = snapshot;
         NotifyExternalStateChanged();
         var dashboard = _dashboard;
@@ -1047,6 +1196,77 @@ internal sealed class DashboardApp
         RequestRefresh();
         NotifyExternalStateChanged();
         return update;
+    }
+
+    internal IReadOnlyList<string> LocalReviewDirectories => _settings.LocalReviewDirectories.ToArray();
+
+    internal IReadOnlyList<ReviewAgentSettings> LocalReviewAgents => _settings.CodexReview.AvailableAgents;
+
+    internal IReadOnlyList<ReviewAgentSettings> ReviewAgents => _settings.CodexReview.AvailableAgents;
+
+    internal LocalReviewProgress? GetLocalReviewProgress(string directory)
+    {
+        return _localReviewCoordinator.GetProgress(directory);
+    }
+
+    internal bool IsLocalReviewRunning(string directory)
+    {
+        return _localReviewCoordinator.IsRunning(directory);
+    }
+
+    internal bool CancelLocalReview(string directory)
+    {
+        return _localReviewCoordinator.Cancel(directory);
+    }
+
+    internal LocalDirectorySettingsUpdate AddLocalReviewDirectory(string directory)
+    {
+        var normalized = AppSettings.ResolveLocalReviewDirectory(_settingsPath, directory);
+        if (!Directory.Exists(normalized))
+        {
+            throw new DirectoryNotFoundException($"Local review directory was not found: {normalized}");
+        }
+
+        var update = _settings.AddLocalReviewDirectory(normalized);
+        if (!update.Added)
+        {
+            return update;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        NotifyExternalStateChanged();
+        return update;
+    }
+
+    internal bool RemoveLocalReviewDirectory(string directory)
+    {
+        if (_localReviewCoordinator.IsRunning(directory))
+        {
+            return false;
+        }
+
+        if (!_settings.RemoveLocalReviewDirectory(directory))
+        {
+            return false;
+        }
+
+        _settings.Save();
+        _settingsLastWriteUtc = GetSettingsLastWriteUtc();
+        _localReviewCoordinator.Forget(directory);
+        NotifyExternalStateChanged();
+        return true;
+    }
+
+    internal Task<LocalReviewOutcome> ReviewLocalDirectoryAsync(
+        string directory,
+        IReadOnlyCollection<ReviewAgentSettings> agents,
+        CancellationToken cancellationToken)
+    {
+        return _localReviewCoordinator.ReviewAsync(
+            directory,
+            _settings.CodexReview.WithAgents(agents),
+            cancellationToken);
     }
 
     private string RepositorySummary()
@@ -3813,7 +4033,11 @@ internal static class NotificationSound
 internal sealed class AppSettings
 {
     private const int DefaultRequiredApprovals = 2;
+    private static StringComparer LocalPathComparer => OperatingSystem.IsWindows()
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
     private readonly List<RepositoryRef> _repositories;
+    private readonly List<string> _localReviewDirectories;
     private readonly List<TopPullRequest> _topPullRequests;
     private readonly List<IgnoredPullRequest> _ignoredPullRequests;
 
@@ -3821,6 +4045,7 @@ internal sealed class AppSettings
         string settingsPath,
         int requiredApprovals,
         IEnumerable<RepositoryRef> repositories,
+        IEnumerable<string> localReviewDirectories,
         IEnumerable<TopPullRequest> topPullRequests,
         IEnumerable<IgnoredPullRequest> ignoredPullRequests,
         PrioritySettings priority,
@@ -3832,6 +4057,9 @@ internal sealed class AppSettings
         CodexReview = codexReview;
         _repositories = repositories
             .DistinctBy(repo => repo.FullName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _localReviewDirectories = localReviewDirectories
+            .Distinct(LocalPathComparer)
             .ToList();
         _topPullRequests = topPullRequests
             .DistinctBy(pr => pr.Key, StringComparer.OrdinalIgnoreCase)
@@ -3850,6 +4078,8 @@ internal sealed class AppSettings
     public CodexReviewSettings CodexReview { get; private set; }
 
     public IReadOnlyList<RepositoryRef> Repositories => _repositories;
+
+    public IReadOnlyList<string> LocalReviewDirectories => _localReviewDirectories;
 
     public IReadOnlyList<TopPullRequest> TopPullRequests => _topPullRequests;
 
@@ -3879,11 +4109,13 @@ internal sealed class AppSettings
                 [],
                 [],
                 [],
+                [],
                 PrioritySettings.Default,
                 CodexReviewSettings.Default);
         }
 
         var repositories = new List<RepositoryRef>();
+        var localReviewDirectories = new List<string>();
         var topPullRequests = new List<TopPullRequest>();
         var ignoredPullRequests = new List<IgnoredPullRequest>();
         var requiredApprovals = DefaultRequiredApprovals;
@@ -3908,6 +4140,14 @@ internal sealed class AppSettings
                 || line.Equals("repos:", StringComparison.OrdinalIgnoreCase))
             {
                 activeList = SettingsList.Repositories;
+                activeSection = SettingsSection.None;
+                continue;
+            }
+
+            if (line.Equals("localReviewDirectories:", StringComparison.OrdinalIgnoreCase)
+                || line.Equals("localDirectories:", StringComparison.OrdinalIgnoreCase))
+            {
+                activeList = SettingsList.LocalReviewDirectories;
                 activeSection = SettingsSection.None;
                 continue;
             }
@@ -4020,10 +4260,18 @@ internal sealed class AppSettings
 
             if (activeList != SettingsList.None && line.StartsWith("-", StringComparison.Ordinal))
             {
-                var value = Unquote(line[1..].Trim());
+                var rawValue = line[1..].Trim();
+                var value = activeList == SettingsList.LocalReviewDirectories
+                    ? UnquoteJsonScalar(rawValue)
+                    : Unquote(rawValue);
                 if (activeList == SettingsList.Repositories && RepositoryRef.TryParse(value, out var repository))
                 {
                     repositories.Add(repository);
+                }
+                else if (activeList == SettingsList.LocalReviewDirectories
+                    && TryResolveLocalReviewDirectory(settingsPath, value, out var localDirectory))
+                {
+                    localReviewDirectories.Add(localDirectory);
                 }
                 else if (activeList == SettingsList.TopPullRequests && TopPullRequest.TryParse(value, out var topPullRequest))
                 {
@@ -4048,6 +4296,7 @@ internal sealed class AppSettings
             settingsPath,
             requiredApprovals,
             repositories,
+            localReviewDirectories,
             topPullRequests,
             ignoredPullRequests,
             priority.Build(),
@@ -4072,6 +4321,39 @@ internal sealed class AppSettings
         }
 
         return new SettingsUpdateResult(added, alreadyTracked);
+    }
+
+    public LocalDirectorySettingsUpdate AddLocalReviewDirectory(string directory)
+    {
+        var normalized = ResolveLocalReviewDirectory(SettingsPath, directory);
+        if (_localReviewDirectories.Contains(normalized, LocalPathComparer))
+        {
+            return new LocalDirectorySettingsUpdate(normalized, Added: false);
+        }
+
+        _localReviewDirectories.Add(normalized);
+        return new LocalDirectorySettingsUpdate(normalized, Added: true);
+    }
+
+    public bool RemoveLocalReviewDirectory(string directory)
+    {
+        var normalized = ResolveLocalReviewDirectory(SettingsPath, directory);
+        return _localReviewDirectories.RemoveAll(candidate => LocalPathComparer.Equals(candidate, normalized)) > 0;
+    }
+
+    public bool ReplaceLocalReviewDirectories(IReadOnlyList<string> directories)
+    {
+        var replacement = directories
+            .Distinct(LocalPathComparer)
+            .ToArray();
+        if (_localReviewDirectories.SequenceEqual(replacement, LocalPathComparer))
+        {
+            return false;
+        }
+
+        _localReviewDirectories.Clear();
+        _localReviewDirectories.AddRange(replacement);
+        return true;
     }
 
     public bool AddIgnoredPullRequest(IgnoredPullRequest pullRequest)
@@ -4221,6 +4503,12 @@ internal sealed class AppSettings
             builder.AppendLine($"  - {repo.Url}");
         }
 
+        builder.AppendLine("localReviewDirectories:");
+        foreach (var localPath in _localReviewDirectories.OrderBy(path => path, LocalPathComparer))
+        {
+            builder.AppendLine($"  - {JsonSerializer.Serialize(localPath)}");
+        }
+
         builder.AppendLine("topPullRequests:");
         foreach (var pr in _topPullRequests)
         {
@@ -4261,7 +4549,7 @@ internal sealed class AppSettings
         builder.AppendLine($"  eligibilityCheckSeconds: {CodexReview.EligibilityCheckSeconds.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine($"  maxOpenPullRequests: {CodexReview.MaxOpenPullRequests.ToString(CultureInfo.InvariantCulture)}");
         builder.AppendLine("  agents:");
-        foreach (var agent in CodexReview.Agents)
+        foreach (var agent in CodexReview.AvailableAgents)
         {
             builder.AppendLine($"    {agent.AgentName}:");
             builder.AppendLine($"      enabled: {agent.Enabled.ToString().ToLowerInvariant()}");
@@ -4544,6 +4832,51 @@ internal sealed class AppSettings
             .TrimEnd('\n');
     }
 
+    internal static string ResolveLocalReviewDirectory(string settingsPath, string configuredPath)
+    {
+        if (!TryResolveLocalReviewDirectory(settingsPath, configuredPath, out var directory))
+        {
+            throw new ArgumentException("Local review directory is empty or invalid", nameof(configuredPath));
+        }
+
+        return directory;
+    }
+
+    private static bool TryResolveLocalReviewDirectory(
+        string settingsPath,
+        string configuredPath,
+        out string directory)
+    {
+        directory = string.Empty;
+        try
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(configuredPath.Trim());
+            if (expanded.Length == 0)
+            {
+                return false;
+            }
+
+            if (expanded.StartsWith("~/", StringComparison.Ordinal)
+                || expanded.StartsWith("~\\", StringComparison.Ordinal))
+            {
+                expanded = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    expanded[2..]);
+            }
+
+            var settingsDirectory = Path.GetDirectoryName(Path.GetFullPath(settingsPath))
+                ?? AppContext.BaseDirectory;
+            directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.IsPathRooted(expanded)
+                ? expanded
+                : Path.Combine(settingsDirectory, expanded)));
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     private static string GetSettingsPath()
     {
         var configuredPath = Environment.GetEnvironmentVariable(UiLauncher.SettingsPathEnvironmentVariable);
@@ -4594,12 +4927,29 @@ internal sealed class AppSettings
 
         return value;
     }
+
+    private static string UnquoteJsonScalar(string value)
+    {
+        if (value.Length >= 2 && value[0] == '"' && value[^1] == '"')
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<string>(value) ?? string.Empty;
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
+        return Unquote(value);
+    }
 }
 
 internal enum SettingsList
 {
     None,
     Repositories,
+    LocalReviewDirectories,
     TopPullRequests,
     IgnoredPullRequests,
     PriorityIgnoredCommentAuthors,
@@ -4643,7 +4993,7 @@ internal sealed record PrioritySettings(
         NoReviewsNoCommentsPoints: 10,
         TwentyDaysPoints: 35,
         LessThanThreeHoursNoCommentsPoints: -30,
-        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "kimi", "deepseek", "deepcode", "copilot"]);
+        IgnoredCommentAuthorPatterns: ["[bot]", "bot", "codex", "claude", "kimi", "deepseek", "deepcode", "opencode", "copilot"]);
 
     public PrioritySettingsBuilder ToBuilder()
     {
@@ -5215,6 +5565,8 @@ internal sealed record RepositoryRef(string Owner, string Name)
 internal sealed record SettingsUpdateResult(
     IReadOnlyList<RepositoryRef> Added,
     IReadOnlyList<RepositoryRef> AlreadyTracked);
+
+internal sealed record LocalDirectorySettingsUpdate(string Directory, bool Added);
 
 internal sealed record FetchResult(
     IReadOnlyList<PullRequestInfo> Items,

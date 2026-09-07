@@ -23,16 +23,33 @@ if (args is ["--deepcode-update-prompt-holder"])
     return Console.ReadKey(intercept: true).Key == ConsoleKey.Escape ? 42 : 43;
 }
 
+if (args is ["--utf8-output-holder"])
+{
+    Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    Console.Write("output\u2014text");
+    Console.Error.Write("error\u2014text");
+    return 0;
+}
+
 var failures = new List<string>();
 await RunAsync("new process replaces previous instance", TestSingleInstanceReplacementAsync);
 await RunAsync("shared dashboard process replaces previous instance", TestDashboardSingleInstanceReplacementAsync);
 await RunAsync("settings default disabled and round trip", TestSettingsRoundTripAsync);
 await RunAsync("UI command and companion discovery", TestUiCommandAsync);
 await RunAsync("desktop dashboard repository action", TestDashboardRepositoryActionAsync);
+await RunAsync("local review directory settings", TestLocalReviewDirectorySettingsAsync);
+await RunAsync("isolated local review snapshot", TestLocalReviewSnapshotAsync);
+await RunAsync("unborn Git directory uses complete snapshot", TestUnbornLocalReviewSnapshotAsync);
+await RunAsync("local review Markdown report", TestLocalReviewReportAsync);
+await RunAsync("local review recovers completed cleanup-failed stages", TestLocalReviewRecoveryAsync);
+await RunAsync("local reviews run in parallel and persist per directory", TestParallelLocalReviewPersistenceAsync);
 await RunAsync("PR search matches title number and author", TestPullRequestSearchAsync);
 await RunAsync("top PR settings cleanup", TestTopPullRequestCleanupAsync);
 await RunAsync("review workspace path", TestReviewWorkspacePathAsync);
 await RunAsync("review agent invocation", TestReviewAgentInvocationAsync);
+await RunAsync("review model catalog", TestReviewModelCatalogAsync);
+await RunAsync("activity journal persists grouped operation steps", TestActivityJournalAsync);
+await RunAsync("process output uses UTF-8", TestProcessOutputEncodingAsync);
 await RunAsync("Codex schema uses BOM-free JSON", TestCodexSchemaEncodingAsync);
 await RunAsync("review comment tone", TestReviewCommentToneAsync);
 await RunAsync("review summary is neutral and specific", TestReviewSummaryAsync);
@@ -43,9 +60,11 @@ await RunAsync("review diff anchors", TestReviewDiffAnchorsAsync);
 await RunAsync("Claude structured review output", TestClaudeStructuredOutputAsync);
 await RunAsync("Kimi structured review output", TestKimiStructuredOutputAsync);
 await RunAsync("DeepSeek structured review output", TestDeepSeekStructuredOutputAsync);
+await RunAsync("OpenCode structured review output", TestOpenCodeStructuredOutputAsync);
 await RunAsync("collaborative review ledger and failure isolation", TestCollaborativeReviewPipelineAsync);
 await RunAsync("review worktree resets after every agent", TestReviewWorktreeResetAsync);
 await RunAsync("Deep Code safety settings", TestDeepCodeSafetySettingsAsync);
+await RunAsync("Deep Code session reads allow concurrent writes", TestDeepCodeSharedSessionReadAsync);
 await RunAsync("Deep Code hidden update prompt", TestDeepCodeHiddenUpdatePromptAsync);
 await RunAsync("startup review scan lookback", TestStartupScanLookbackAsync);
 await RunAsync("manual review enqueue persistence", TestManualReviewEnqueueAsync);
@@ -212,7 +231,7 @@ Task TestSettingsRoundTripAsync()
         Equal(false, settings.CodexReview.AutoSubmit, "review auto-send must be disabled by default");
         Equal(20d, settings.CodexReview.ReadyDelayMinutes, "default delay");
         Equal(4, settings.CodexReview.StartupScanDays, "default startup scan");
-        Equal(4, settings.CodexReview.Agents.Count, "default review pipeline size");
+        Equal(5, settings.CodexReview.Agents.Count, "default review pipeline size");
         Equal("workspace-write", settings.CodexReview.Sandbox, "default review sandbox");
         var defaultCodex = settings.CodexReview.EnabledAgents.Single();
         Equal(ReviewAgent.Codex, defaultCodex.Agent, "default enabled review agent");
@@ -234,6 +253,7 @@ Task TestSettingsRoundTripAsync()
         Equal(false, loaded.CodexReview.PostNoFindingsComment, "no-findings comments must stay disabled");
         Assert(loaded.CodexReview.IgnoredAuthorPatterns.Contains("codex"), "default bot patterns were lost");
         Assert(loaded.CodexReview.IgnoredAuthorPatterns.Contains("kimi"), "Kimi bot pattern was lost");
+        Assert(loaded.CodexReview.IgnoredAuthorPatterns.Contains("opencode"), "OpenCode bot pattern was lost");
 
         File.WriteAllText(
             path,
@@ -312,24 +332,42 @@ Task TestSettingsRoundTripAsync()
                   enabled: true
                   model: deepseek-v4-pro
                   effort: high
+                opencode:
+                  enabled: true
+                  model: opencode/big-pickle
+                  effort: max
             """);
         var collaborative = AppSettings.Load(path).CodexReview;
         Equal(
-            "Codex,Kimi,DeepSeek",
+            "Codex,Kimi,DeepSeek,OpenCode",
             string.Join(',', collaborative.EnabledAgents.Select(agent => agent.Agent)),
             "enabled collaborative agents");
         Equal<string?>(null, collaborative.Agents.Single(agent => agent.Agent == ReviewAgent.Kimi).Effort, "Kimi effort must be ignored");
         Equal("high", collaborative.Agents.Single(agent => agent.Agent == ReviewAgent.DeepSeek).Effort, "DeepSeek effort");
+        Equal("max", collaborative.Agents.Single(agent => agent.Agent == ReviewAgent.OpenCode).Effort, "OpenCode effort");
         var collaborativeSettings = AppSettings.Load(path);
         collaborativeSettings.Save();
         var collaborativeRoundTrip = AppSettings.Load(path).CodexReview;
         Equal(
-            "Codex,Claude,Kimi,DeepSeek",
+            "Codex,Claude,Kimi,DeepSeek,OpenCode",
             string.Join(',', collaborativeRoundTrip.Agents.Select(agent => agent.Agent)),
             "collaborative pipeline order after save");
         Assert(
             collaborative.SemanticallyEquals(collaborativeRoundTrip),
             "collaborative pipeline changed after save");
+
+        const string museModel = "opencode/muse-spark-1.2-contributor-free";
+        var selectedOpenCode = collaborative.WithAgents(collaborative.AvailableAgents.Select(agent =>
+            agent.Agent == ReviewAgent.OpenCode
+                ? agent with { Enabled = true, Model = museModel }
+                : agent with { Enabled = false }));
+        Equal("OpenCode", string.Join(',', selectedOpenCode.EnabledAgents.Select(agent => agent.Agent)), "selected UI agents");
+        Equal(museModel, selectedOpenCode.EnabledAgents.Single().Model, "selected UI model");
+        collaborativeSettings.ReplaceCodexReview(selectedOpenCode);
+        collaborativeSettings.Save();
+        var selectedRoundTrip = AppSettings.Load(path).CodexReview;
+        Equal("OpenCode", string.Join(',', selectedRoundTrip.EnabledAgents.Select(agent => agent.Agent)), "persisted UI agents");
+        Equal(museModel, selectedRoundTrip.EnabledAgents.Single().Model, "persisted UI model");
     }
     finally
     {
@@ -416,6 +454,493 @@ Task TestDashboardRepositoryActionAsync()
     return Task.CompletedTask;
 }
 
+Task TestLocalReviewDirectorySettingsAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-settings-" + Guid.NewGuid().ToString("N"));
+    var source = Path.Combine(directory, "source");
+    Directory.CreateDirectory(source);
+    try
+    {
+        var settingsPath = Path.Combine(directory, ".pr.yml");
+        var dashboard = new DashboardApp(AppSettings.Load(settingsPath));
+        var added = dashboard.AddLocalReviewDirectory(source);
+        Equal(true, added.Added, "local directory was not added");
+        Equal(Path.GetFullPath(source), dashboard.LocalReviewDirectories.Single(), "dashboard local directory");
+        Equal(false, dashboard.AddLocalReviewDirectory(source + Path.DirectorySeparatorChar).Added, "duplicate local directory was added");
+
+        var loaded = AppSettings.Load(settingsPath);
+        Equal(Path.GetFullPath(source), loaded.LocalReviewDirectories.Single(), "local directory did not round trip");
+        Assert(File.ReadAllText(settingsPath).Contains("localReviewDirectories:", StringComparison.Ordinal), "local directory settings section was not saved");
+
+        File.WriteAllText(settingsPath, "localReviewDirectories:\n  - ./source\n");
+        var relative = AppSettings.Load(settingsPath);
+        Equal(Path.GetFullPath(source), relative.LocalReviewDirectories.Single(), "relative local directory was not settings-relative");
+
+        Equal(true, dashboard.RemoveLocalReviewDirectory(source), "local directory was not removed");
+        Equal(0, dashboard.LocalReviewDirectories.Count, "removed local directory remained in memory");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+async Task TestLocalReviewSnapshotAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-snapshot-" + Guid.NewGuid().ToString("N"));
+    var source = Path.Combine(directory, "source");
+    var data = Path.Combine(directory, "review-data");
+    var workspaceRoot = Path.Combine(directory, "workspace");
+    Directory.CreateDirectory(Path.Combine(source, "src"));
+    Directory.CreateDirectory(Path.Combine(source, "bin"));
+    Directory.CreateDirectory(Path.Combine(source, "scripts", "build"));
+    File.WriteAllText(Path.Combine(source, ".gitignore"), "bin/\nbuild/\n");
+    File.WriteAllText(Path.Combine(source, "src", "Tracked.cs"), "class Tracked { }\n");
+    File.WriteAllText(Path.Combine(source, "scripts", "build", "archive.sh"), "#!/bin/sh\nexit 0\n");
+    File.WriteAllText(Path.Combine(source, "bin", "generated.dll"), "generated");
+    try
+    {
+        async Task<ProcessResult> GitAsync(params string[] arguments)
+        {
+            var result = await ProcessRunner.RunAsync(
+                "git",
+                ["-C", source, .. arguments],
+                source,
+                input: null,
+                timeout: TimeSpan.FromMinutes(1),
+                eligibilityCheckInterval: null,
+                stillEligible: null,
+                CancellationToken.None);
+            Assert(result.ExitCode == 0, $"git {arguments[0]} failed: {result.StandardError}");
+            return result;
+        }
+
+        await GitAsync("init", "--quiet");
+        await GitAsync("config", "user.name", "pr tests");
+        await GitAsync("config", "user.email", "pr-tests@invalid");
+        await GitAsync("add", ".gitignore", "src/Tracked.cs");
+        await GitAsync("add", "-f", "scripts/build/archive.sh");
+        await GitAsync("update-index", "--chmod=+x", "--", "scripts/build/archive.sh");
+        await GitAsync("commit", "--quiet", "--no-gpg-sign", "-m", "initial");
+        var baseline = (await GitAsync("rev-parse", "HEAD")).StandardOutput.Trim();
+        await GitAsync("update-ref", "refs/remotes/origin/main", baseline);
+        await GitAsync("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+        await GitAsync("switch", "--quiet", "-c", "feature/local-review");
+        File.WriteAllText(Path.Combine(source, "src", "Tracked.cs"), "class Tracked { int Value => 1; }\n");
+        await GitAsync("add", "src/Tracked.cs");
+        await GitAsync("commit", "--quiet", "--no-gpg-sign", "-m", "branch change");
+        File.WriteAllText(Path.Combine(source, "src", "Untracked.cs"), "class Untracked { }\n");
+        File.WriteAllText(Path.Combine(source, LocalReviewReportWriter.ReportFileName), "stale report");
+
+        var settings = CodexReviewSettings.Default with
+        {
+            DataDirectory = data,
+            WorkspaceDirectory = workspaceRoot,
+        };
+        LocalReviewWorkspace? workspace = null;
+        try
+        {
+            workspace = await LocalReviewWorkspace.CreateAsync(
+                source,
+                directory,
+                settings,
+                _ => { },
+                CancellationToken.None);
+            var snapshot = workspace.Paths.WorktreeDirectory;
+            Assert(File.Exists(Path.Combine(snapshot, "src", "Tracked.cs")), "tracked source was omitted from snapshot");
+            Assert(File.Exists(Path.Combine(snapshot, "scripts", "build", "archive.sh")), "tracked ignored executable was omitted from snapshot");
+            Assert(File.Exists(Path.Combine(snapshot, "src", "Untracked.cs")), "untracked source was omitted from snapshot");
+            Assert(!File.Exists(Path.Combine(snapshot, "bin", "generated.dll")), "gitignored output was copied into snapshot");
+            Assert(!File.Exists(Path.Combine(snapshot, LocalReviewReportWriter.ReportFileName)), "previous local report was copied into snapshot");
+            Assert(File.ReadAllText(workspace.Paths.KimiDiffPath).Contains("Untracked.cs", StringComparison.Ordinal), "local scope manifest omitted an untracked source file");
+            Assert(File.ReadAllText(workspace.Paths.KimiDiffPath).Contains("Tracked.cs", StringComparison.Ordinal), "local scope manifest omitted a committed branch change");
+            Assert(workspace.IsGitChangeReview, "Git repository used whole-project review scope");
+            Equal("Git changes against origin/main", workspace.ScopeDescription, "local Git scope description");
+            Equal(2, workspace.ScopedFileCount, "local Git changed-file count");
+            var executableEntry = await ProcessRunner.RunAsync(
+                "git",
+                ["-C", snapshot, "ls-files", "--stage", "--", "scripts/build/archive.sh"],
+                snapshot,
+                input: null,
+                timeout: TimeSpan.FromMinutes(1),
+                eligibilityCheckInterval: null,
+                stillEligible: null,
+                CancellationToken.None);
+            Assert(executableEntry.ExitCode == 0, $"snapshot executable lookup failed: {executableEntry.StandardError}");
+            Assert(executableEntry.StandardOutput.StartsWith("100755 ", StringComparison.Ordinal), "tracked ignored executable mode was not preserved");
+
+            var prompt = LocalReviewPrompt.Build(
+                workspace,
+                ReviewAgentSettings.DefaultFor(ReviewAgent.Codex),
+                "Project context");
+            Assert(prompt.Contains("local change review", StringComparison.Ordinal), "local prompt omitted change-only scope");
+            Assert(!prompt.Contains("whole-project review", StringComparison.Ordinal), "Git prompt retained whole-project scope");
+            Assert(!prompt.Contains(source, StringComparison.Ordinal), "local prompt exposed the original source path");
+            Assert(prompt.Contains(snapshot, StringComparison.Ordinal), "local prompt omitted the disposable worktree path");
+            Assert(prompt.Contains("side must be `RIGHT`", StringComparison.Ordinal), "local prompt did not constrain full-snapshot anchors");
+
+            var result = new CodexReviewResult
+            {
+                Summary = "Snapshot findings",
+                Findings =
+                [
+                    new CodexReviewFinding
+                    {
+                        Severity = "high",
+                        Title = "Valid anchor",
+                        Body = "Evidence",
+                        Path = "src/Tracked.cs",
+                        Line = 1,
+                        Side = "RIGHT",
+                    },
+                    new CodexReviewFinding
+                    {
+                        Severity = "low",
+                        Title = "Escaping anchor",
+                        Body = "Evidence",
+                        Path = "../outside.cs",
+                        Line = 1,
+                        Side = "RIGHT",
+                    },
+                ],
+            };
+            Equal(1, LocalReviewResultValidator.RemoveInvalidAnchors(result, snapshot), "invalid local anchor count");
+            Equal("src/Tracked.cs", result.Findings.Single().Path, "valid local finding path");
+            Equal("class Tracked { int Value => 1; }\n", File.ReadAllText(Path.Combine(source, "src", "Tracked.cs")), "source file changed during snapshot setup");
+        }
+        finally
+        {
+            if (workspace is not null)
+            {
+                var container = workspace.ContainerDirectory;
+                await workspace.DisposeAsync();
+                Assert(!Directory.Exists(container), "disposable local snapshot was not removed");
+            }
+        }
+    }
+    finally
+    {
+        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+async Task TestUnbornLocalReviewSnapshotAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-unborn-" + Guid.NewGuid().ToString("N"));
+    var source = Path.Combine(directory, "source");
+    Directory.CreateDirectory(source);
+    File.WriteAllText(Path.Combine(source, "Program.cs"), "Console.WriteLine(1);\n");
+    LocalReviewWorkspace? workspace = null;
+    try
+    {
+        var init = await ProcessRunner.RunAsync(
+            "git",
+            ["-C", source, "init", "--quiet"],
+            source,
+            input: null,
+            timeout: TimeSpan.FromMinutes(1),
+            eligibilityCheckInterval: null,
+            stillEligible: null,
+            CancellationToken.None);
+        Assert(init.ExitCode == 0, $"unborn git init failed: {init.StandardError}");
+        workspace = await LocalReviewWorkspace.CreateAsync(
+            source,
+            directory,
+            CodexReviewSettings.Default with
+            {
+                DataDirectory = Path.Combine(directory, "data"),
+                WorkspaceDirectory = Path.Combine(directory, "workspace"),
+            },
+            _ => { },
+            CancellationToken.None);
+        Assert(!workspace.IsGitChangeReview, "unborn Git repository did not use complete-project scope");
+        Equal(1, workspace.ScopedFileCount, "unborn Git complete-project file count");
+    }
+    finally
+    {
+        if (workspace is not null)
+        {
+            await workspace.DisposeAsync();
+        }
+
+        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+Task TestLocalReviewReportAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-report-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var agents = new[]
+        {
+            ReviewAgentSettings.DefaultFor(ReviewAgent.Codex),
+            ReviewAgentSettings.DefaultFor(ReviewAgent.Kimi) with { Enabled = true },
+        };
+        var progress = LocalReviewProgress.Start(directory, agents, DateTimeOffset.UtcNow.AddMinutes(-2));
+        foreach (var (agent, index) in agents.Select((agent, index) => (agent, index + 1)))
+        {
+            progress = progress.Apply(new ReviewAgentStageUpdate(
+                agent,
+                index,
+                agents.Length,
+                ReviewAgentStageStatus.Completed,
+                ReturnedFindings: 1,
+                AcceptedFindings: 1,
+                Error: null,
+                Timestamp: DateTimeOffset.UtcNow));
+        }
+
+        var result = new CodexReviewResult
+        {
+            Summary = "Two concrete issues were identified.",
+            Findings =
+            [
+                new CodexReviewFinding { Severity = "low", Title = "Second issue", Body = "Low impact.", Path = "b.cs", Line = 2, Side = "RIGHT" },
+                new CodexReviewFinding { Severity = "high", Title = "First issue", Body = "High impact.", Path = "a.cs", Line = 1, Side = "RIGHT" },
+            ],
+        };
+        var collaborative = new CollaborativeReviewOutcome(result, agents, []);
+        var report = LocalReviewReportWriter.Write(
+            directory,
+            collaborative,
+            progress,
+            Path.Combine(directory, "artifacts"),
+            "Git changes against origin/main",
+            omittedFindings: 0);
+        Equal(Path.Combine(directory, LocalReviewReportWriter.ReportFileName), report, "local report path");
+        var content = File.ReadAllText(report);
+        Assert(content.Contains("[HIGH] First issue", StringComparison.Ordinal), "high issue was omitted from report");
+        Assert(content.Contains("[LOW] Second issue", StringComparison.Ordinal), "low issue was omitted from report");
+        Assert(content.IndexOf("First issue", StringComparison.Ordinal) < content.IndexOf("Second issue", StringComparison.Ordinal), "report was not severity ordered");
+        Assert(content.Contains("## Agent status", StringComparison.Ordinal), "agent status was omitted from report");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+Task TestLocalReviewRecoveryAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-recovery-" + Guid.NewGuid().ToString("N"));
+    var worktree = Path.Combine(directory, "worktrees", "run", "worktree");
+    var runs = Path.Combine(directory, "runs");
+    Directory.CreateDirectory(worktree);
+    Directory.CreateDirectory(runs);
+    try
+    {
+        var paths = new ReviewPaths(
+            directory,
+            directory,
+            Path.Combine(directory, "repositories"),
+            Path.Combine(directory, "worktrees"),
+            worktree,
+            worktree,
+            runs,
+            "local-recovery-test",
+            PullRequestNumber: 0,
+            Path.Combine(directory, "schema.json"),
+            Path.Combine(runs, "prompt.md"),
+            Path.Combine(runs, "result.json"),
+            Path.Combine(runs, "stdout.log"),
+            Path.Combine(runs, "stderr.log"));
+        var codex = ReviewAgentSettings.DefaultFor(ReviewAgent.Codex) with { Enabled = true };
+        var claude = ReviewAgentSettings.DefaultFor(ReviewAgent.Claude) with { Enabled = true };
+        var deepSeek = ReviewAgentSettings.DefaultFor(ReviewAgent.DeepSeek) with { Enabled = true };
+        ReviewAgentSettings[] pipeline = [codex, claude, deepSeek];
+        var progress = LocalReviewProgress.Start(directory, pipeline, DateTimeOffset.UtcNow);
+        progress = progress.Apply(new ReviewAgentStageUpdate(
+            codex, 1, pipeline.Length, ReviewAgentStageStatus.Completed, 1, 1, null, DateTimeOffset.UtcNow));
+        progress = progress.Apply(new ReviewAgentStageUpdate(
+            claude, 2, pipeline.Length, ReviewAgentStageStatus.Failed, 0, 0, "provider unavailable", DateTimeOffset.UtcNow));
+        progress = progress.Apply(new ReviewAgentStageUpdate(
+            deepSeek, 3, pipeline.Length, ReviewAgentStageStatus.Failed, 0, 0, "worktree cleanup failed", DateTimeOffset.UtcNow));
+
+        var first = PipelineFinding("high", "First recovered issue", "Initial evidence", "src/a.cs", 12);
+        var second = PipelineFinding("medium", "Second recovered issue", "Additional evidence", "src/b.cs", 30);
+        File.WriteAllText(
+            paths.AgentResultPath(codex.Agent),
+            JsonSerializer.Serialize(new CodexReviewResult { Summary = "First result", Findings = [first] }, JsonDefaults.Options));
+        File.WriteAllText(
+            paths.AgentResultPath(deepSeek.Agent),
+            JsonSerializer.Serialize(
+                new CodexReviewResult { Summary = "Final result", Findings = [first, second] },
+                JsonDefaults.Options));
+
+        var outcome = LocalReviewRecovery.Recover(
+            pipeline,
+            progress,
+            paths,
+            maxFindings: 10,
+            new ReviewWorktreeResetException(
+                "cleanup failed",
+                new IOException("locked file"),
+                deepSeek.AgentDisplayName,
+                stageCompleted: true));
+
+        Equal("codex+deepseek", outcome.SuccessfulAgentNames, "recovered successful agents");
+        Equal(2, outcome.Result.Findings.Count, "recovered deduplicated findings");
+        Equal(2, outcome.Failures.Count, "recovered failure details");
+        Assert(outcome.Failures.Any(failure => failure.Agent == claude.AgentName), "earlier agent failure was lost");
+        Assert(outcome.Failures.Any(failure => failure.Agent == deepSeek.AgentName), "cleanup failure was lost");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+async Task TestParallelLocalReviewPersistenceAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-local-parallel-" + Guid.NewGuid().ToString("N"));
+    var firstSource = Path.Combine(directory, "first");
+    var secondSource = Path.Combine(directory, "second");
+    var dataDirectory = Path.Combine(directory, "data");
+    var workspaceDirectory = Path.Combine(directory, "workspace");
+    var settingsPath = Path.Combine(directory, ".pr.yml");
+    Directory.CreateDirectory(firstSource);
+    Directory.CreateDirectory(secondSource);
+    File.WriteAllText(Path.Combine(firstSource, "First.cs"), "class First { }\n");
+    File.WriteAllText(Path.Combine(secondSource, "Second.cs"), "class Second { }\n");
+    var settings = CodexReviewSettings.Default with
+    {
+        DataDirectory = dataDirectory,
+        WorkspaceDirectory = workspaceDirectory,
+    };
+    var selectedSettings = settings.WithEnabledAgents([ReviewAgent.Claude, ReviewAgent.DeepSeek, ReviewAgent.OpenCode]);
+    Equal(5, selectedSettings.AvailableAgents.Count, "available local review agents");
+    Equal(
+        "claude,deepseek,opencode",
+        string.Join(',', selectedSettings.EnabledAgents.Select(agent => agent.AgentName)),
+        "per-run local agent selection");
+    Equal(
+        "deepcode",
+        selectedSettings.EnabledAgents.Single(agent => agent.Agent == ReviewAgent.DeepSeek).ResolvedCommand,
+        "Deep Code command selection");
+    Equal(
+        "opencode",
+        selectedSettings.EnabledAgents.Single(agent => agent.Agent == ReviewAgent.OpenCode).ResolvedCommand,
+        "OpenCode command selection");
+
+    var bothStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var releaseAgents = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var startedCount = 0;
+    Task<LocalReviewOutcome>? firstTask = null;
+    Task<LocalReviewOutcome>? secondTask = null;
+    try
+    {
+        var coordinator = new LocalReviewCoordinator(
+            settingsPath,
+            settings,
+            () => { },
+            async (_, runSettings, _, agent, cancellationToken) =>
+            {
+                Equal("danger-full-access", runSettings.Sandbox, "local Codex sandbox");
+                if (Interlocked.Increment(ref startedCount) == 2)
+                {
+                    bothStarted.TrySetResult();
+                }
+
+                await releaseAgents.Task.WaitAsync(cancellationToken);
+                return new CodexReviewResult
+                {
+                    Summary = $"{agent.AgentDisplayName} completed the test review",
+                    Findings = [],
+                };
+            });
+        var oneAgentSettings = settings.WithEnabledAgents([ReviewAgent.Codex]);
+        firstTask = coordinator.ReviewAsync(firstSource, oneAgentSettings, CancellationToken.None);
+        secondTask = coordinator.ReviewAsync(secondSource, oneAgentSettings, CancellationToken.None);
+        try
+        {
+            await bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        catch (TimeoutException ex)
+        {
+            throw new TimeoutException(
+                $"Local agents did not both start; first: {coordinator.GetProgress(firstSource)?.Detail ?? "no progress"}; "
+                + $"second: {coordinator.GetProgress(secondSource)?.Detail ?? "no progress"}",
+                ex);
+        }
+        Assert(coordinator.IsRunning(firstSource), "first local directory was not running");
+        Assert(coordinator.IsRunning(secondSource), "second local directory was not running in parallel");
+        try
+        {
+            await coordinator.ReviewAsync(firstSource, oneAgentSettings, CancellationToken.None);
+            throw new InvalidOperationException("a duplicate same-directory review was accepted");
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("already running", StringComparison.Ordinal))
+        {
+        }
+
+        releaseAgents.TrySetResult();
+        await Task.WhenAll(firstTask, secondTask);
+        Equal(ReviewPipelineStatus.Completed, coordinator.GetProgress(firstSource)?.Status, "first local review status");
+        Equal(ReviewPipelineStatus.Completed, coordinator.GetProgress(secondSource)?.Status, "second local review status");
+
+        var restored = new LocalReviewCoordinator(settingsPath, settings, () => { });
+        Equal(ReviewPipelineStatus.Completed, restored.GetProgress(firstSource)?.Status, "persisted first local review");
+        Equal(ReviewPipelineStatus.Completed, restored.GetProgress(secondSource)?.Status, "persisted second local review");
+        Assert(
+            File.Exists(Path.Combine(dataDirectory, "local-review-state.json")),
+            "local review state file was not written");
+
+        var interrupted = LocalReviewProgress.Start(
+            firstSource,
+            oneAgentSettings.EnabledAgents,
+            DateTimeOffset.UtcNow.AddMinutes(-1));
+        new LocalReviewStateStore(directory, settings).Save([interrupted]);
+        var afterRestart = new LocalReviewCoordinator(settingsPath, settings, () => { });
+        var interruptedProgress = afterRestart.GetProgress(firstSource);
+        Equal(ReviewPipelineStatus.Failed, interruptedProgress?.Status, "interrupted local review status");
+        Assert(
+            interruptedProgress?.Detail?.Contains("Interrupted", StringComparison.Ordinal) == true,
+            "interrupted local review detail was not restored");
+    }
+    finally
+    {
+        releaseAgents.TrySetResult();
+        if (firstTask is not null && secondTask is not null)
+        {
+            try
+            {
+                await Task.WhenAll(firstTask, secondTask);
+            }
+            catch
+            {
+            }
+        }
+
+        if (Directory.Exists(directory))
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                File.SetAttributes(file, FileAttributes.Normal);
+            }
+
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+}
+
 Task TestTopPullRequestCleanupAsync()
 {
     var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
@@ -483,8 +1008,22 @@ Task TestReviewAgentInvocationAsync()
     Equal("codex", codex.Command, "Codex executable");
     AssertArgumentPair(codex.Arguments, "--model", "gpt-test", "Codex model");
     AssertArgumentPair(codex.Arguments, "--cd", settingsDirectory, "Codex worktree");
-    AssertArgumentPair(codex.Arguments, "--sandbox", "workspace-write", "Codex sandbox");
+    Assert(codex.Arguments.Contains("--approve-for-me"), "Codex workspace-write approval routing was omitted");
+    Assert(!codex.Arguments.Contains("--sandbox"), "Codex combined incompatible workspace-write permission flags");
     Assert(codex.Arguments.Contains("--output-schema"), "Codex output schema was omitted");
+    Assert(codex.Arguments.Contains("--ignore-rules"), "Codex repository execution policies were not isolated");
+    Equal(
+        "Local commands were blocked by Codex policy, so the repository was not reviewed.",
+        LocalReviewAgent.DescribeCompletedProcessProblem(
+            codexAgent,
+            new ProcessResult(0, "{\"summary\":\"Review blocked\",\"findings\":[]}", "exec_command rejected: blocked by policy")),
+        "Codex policy-blocked success detection");
+    Equal<string?>(
+        null,
+        LocalReviewAgent.DescribeCompletedProcessProblem(
+            codexAgent,
+            new ProcessResult(0, "{\"summary\":\"No issues\",\"findings\":[]}", string.Empty)),
+        "Codex clean success detection");
 
     var defaultClaudeAgent = ReviewAgentSettings.DefaultFor(ReviewAgent.Claude) with { Model = null };
     var defaultClaude = LocalReviewAgent.CreateInvocation(defaultClaudeAgent, globalSettings, paths, settingsDirectory);
@@ -508,7 +1047,8 @@ Task TestReviewAgentInvocationAsync()
     Assert(!kimi.PromptInStandardInput, "Kimi prompt was sent through stdin");
     Assert(!kimi.Arguments.Contains("--model"), "Kimi inherited the Codex default model");
     AssertArgumentPair(kimi.Arguments, "--output-format", "stream-json", "Kimi output format");
-    Assert(kimi.Arguments.Contains("--auto"), "Kimi tool approvals were not automatic");
+    Assert(!kimi.Arguments.Contains("--yolo"), "Kimi combined incompatible --prompt and --yolo flags");
+    Assert(!kimi.Arguments.Contains("--auto"), "Kimi combined incompatible --prompt and --auto flags");
     AssertArgumentPair(kimi.Arguments, "--agent-file", paths.KimiAgentPath, "Kimi agent profile");
     AssertArgumentPair(kimi.Arguments, "--skills-dir", paths.KimiSkillsDirectory, "Kimi skills isolation");
     AssertArgumentPair(kimi.Arguments, "--add-dir", paths.RunsDirectory, "Kimi run artifacts");
@@ -532,7 +1072,237 @@ Task TestReviewAgentInvocationAsync()
     Assert(!deepSeek.PromptInStandardInput, "Deep Code prompt was sent through stdin");
     Equal("deepseek-v4-pro", deepSeek.EnvironmentVariables?["DEEPCODE_MODEL"], "Deep Code model environment");
     Equal("max", deepSeek.EnvironmentVariables?["DEEPCODE_REASONING_EFFORT"], "Deep Code effort environment");
+    Equal(
+        "The provider rejected this review as possible cybersecurity content.",
+        LocalReviewAgent.DescribeProcessFailure(
+            codexAgent,
+            new ProcessResult(1, string.Empty, "large transcript\nERROR: This content was flagged for possible cybersecurity risk.")),
+        "Codex provider rejection summary");
+    Equal(
+        "API 429: Session limit reached; resets later",
+        LocalReviewAgent.DescribeProcessFailure(
+            claudeAgent,
+            new ProcessResult(
+                1,
+                "{\"api_error_status\":429,\"result\":\"Session limit reached; resets later\"}",
+                string.Empty)),
+        "Claude API error summary");
+    Equal(
+        "error: Cannot combine --prompt with --yolo.",
+        LocalReviewAgent.DescribeProcessFailure(
+            kimiAgent,
+            new ProcessResult(1, string.Empty, "error: Cannot combine --prompt with --yolo.\nusage text")),
+        "Kimi CLI error summary");
+    Equal(
+        "Deep Code session failed: EBUSY: resource busy or locked",
+        LocalReviewAgent.DescribeProcessFailure(
+            deepSeekAgent,
+            new ProcessResult(1, string.Empty, "Deep Code session failed: EBUSY: resource busy or locked\ntranscript")),
+        "Deep Code session error summary");
+
+    var openCodeAgent = ReviewAgentSettings.DefaultFor(ReviewAgent.OpenCode) with
+    {
+        Enabled = true,
+        Model = "opencode/big-pickle",
+        Effort = "max",
+    };
+    var openCode = LocalReviewAgent.CreateInvocation(openCodeAgent, globalSettings, paths, settingsDirectory);
+    Equal("opencode", openCode.Command, "OpenCode executable");
+    Assert(!openCode.PromptInStandardInput, "OpenCode prompt was sent through stdin");
+    AssertArgumentPair(openCode.Arguments, "--format", "json", "OpenCode output format");
+    AssertArgumentPair(openCode.Arguments, "--dir", settingsDirectory, "OpenCode worktree");
+    AssertArgumentPair(openCode.Arguments, "--model", "opencode/big-pickle", "OpenCode model");
+    AssertArgumentPair(openCode.Arguments, "--variant", "max", "OpenCode effort");
+    Assert(openCode.Arguments.Contains("--auto"), "OpenCode local permissions were not enabled");
+    Assert(openCode.Arguments.Contains("--pure"), "OpenCode plugins were not isolated");
+    var openCodeRoot = Path.Combine(paths.WorkspaceDirectory, "opencode");
+    Equal(Path.Combine(openCodeRoot, "data"), openCode.EnvironmentVariables?["XDG_DATA_HOME"], "OpenCode data directory");
+    Equal(Path.Combine(openCodeRoot, "cache"), openCode.EnvironmentVariables?["XDG_CACHE_HOME"], "OpenCode cache directory");
+    Equal(Path.Combine(openCodeRoot, "state"), openCode.EnvironmentVariables?["XDG_STATE_HOME"], "OpenCode state directory");
+    Equal("{\"snapshot\":false}", openCode.EnvironmentVariables?["OPENCODE_CONFIG_CONTENT"], "OpenCode snapshot setting");
+    Equal(
+        "Configured OpenCode model is unavailable",
+        LocalReviewAgent.DescribeProcessFailure(
+            openCodeAgent,
+            new ProcessResult(
+                1,
+                "{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Configured OpenCode model is unavailable\"}}}",
+                string.Empty)),
+        "OpenCode JSONL error summary");
     return Task.CompletedTask;
+}
+
+Task TestReviewModelCatalogAsync()
+{
+    var codex = ReviewModelCatalog.ParseCodexModels(
+        """
+        {"models":[{"slug":"gpt-first"},{"slug":"gpt-second"},{"name":"ignored"}]}
+        """);
+    Equal("gpt-first,gpt-second", string.Join(',', codex), "Codex model catalog parsing");
+
+    var lineModels = ReviewModelCatalog.ParseLineModels(
+        """
+        opencode/big-pickle
+        opencode/muse-spark-1.2-contributor-free
+        status text
+        opencode/big-pickle
+        """);
+    Equal(
+        "opencode/big-pickle,opencode/muse-spark-1.2-contributor-free",
+        string.Join(',', lineModels),
+        "line model catalog parsing");
+
+    var merged = ReviewModelCatalog.MergeModels(
+        ReviewAgent.OpenCode,
+        "custom/provider-model",
+        ["opencode/muse-spark-1.2-contributor-free"]);
+    Equal("custom/provider-model", merged[0], "current model priority");
+    Assert(merged.Contains("opencode/muse-spark-1.2-contributor-free"), "Muse model missing from picker options");
+    Assert(merged.Contains("opencode/big-pickle"), "OpenCode fallback model missing from picker options");
+    Equal("low,medium,high,xhigh,max", string.Join(',', ReviewEffortCatalog.For(ReviewAgent.Codex)), "Codex effort choices");
+    Equal("high,max", string.Join(',', ReviewEffortCatalog.For(ReviewAgent.DeepSeek)), "DeepSeek effort choices");
+    Equal(false, ReviewEffortCatalog.SupportsEffort(ReviewAgent.Kimi), "Kimi unexpectedly exposes effort");
+    return Task.CompletedTask;
+}
+
+Task TestActivityJournalAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var path = Path.Combine(directory, "journal.json");
+        var journal = new DashboardActivityJournal(path);
+        var startedAt = new DateTimeOffset(2026, 9, 7, 10, 0, 0, TimeSpan.Zero);
+        var refreshId = journal.Start(
+            JournalOperationKind.Refresh,
+            "Refresh pull requests",
+            "owner/repo",
+            [("fetch", "Query GitHub"), ("priority", "Calculate urgency"), ("apply", "Apply dashboard update")],
+            "fetch",
+            "Loading",
+            now: startedAt);
+        journal.UpdateStep(refreshId, "fetch", JournalStepStatus.Completed, "Loaded 12", startedAt.AddSeconds(1));
+        journal.UpdateStep(refreshId, "priority", JournalStepStatus.Running, "Calculating", startedAt.AddSeconds(1));
+        journal.UpdateStep(refreshId, "priority", JournalStepStatus.Completed, "Calculated", startedAt.AddSeconds(2));
+        journal.UpdateStep(refreshId, "apply", JournalStepStatus.Running, "Applying", startedAt.AddSeconds(2));
+        journal.UpdateStep(refreshId, "apply", JournalStepStatus.Completed, "Up to date", startedAt.AddSeconds(3));
+        journal.Finish(refreshId, JournalOperationStatus.Completed, startedAt.AddSeconds(3));
+
+        var pullRequest = new CodexPullRequest(
+            new RepositoryRef("owner", "repo"),
+            42,
+            "https://github.com/owner/repo/pull/42",
+            "Journal review",
+            "OPEN",
+            false,
+            "0123456789abcdef",
+            "main",
+            "member",
+            startedAt,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            "MEMBER");
+        var agent = ReviewAgentSettings.DefaultFor(ReviewAgent.Codex) with
+        {
+            Enabled = true,
+            Model = "gpt-test",
+            Effort = "high",
+        };
+        var progress = ReviewPipelineProgress.Start(pullRequest, isManual: true, [agent], startedAt.AddMinutes(1));
+        progress = progress.Apply(
+            ReviewWorkflowPhase.Eligibility,
+            ReviewAgentStageStatus.Completed,
+            "Eligible",
+            startedAt.AddMinutes(1).AddSeconds(1));
+        progress = progress.Apply(
+            ReviewWorkflowPhase.Workspace,
+            ReviewAgentStageStatus.Running,
+            "Preparing",
+            startedAt.AddMinutes(1).AddSeconds(1));
+        progress = progress.Apply(
+            ReviewWorkflowPhase.Workspace,
+            ReviewAgentStageStatus.Completed,
+            "Ready",
+            startedAt.AddMinutes(1).AddSeconds(2));
+        progress = progress.Apply(new ReviewAgentStageUpdate(
+            agent,
+            1,
+            1,
+            ReviewAgentStageStatus.Running,
+            0,
+            0,
+            null,
+            startedAt.AddMinutes(1).AddSeconds(2)));
+        progress = progress.Apply(new ReviewAgentStageUpdate(
+            agent,
+            1,
+            1,
+            ReviewAgentStageStatus.Completed,
+            2,
+            2,
+            null,
+            startedAt.AddMinutes(1).AddSeconds(5)));
+        progress = progress.Apply(
+            ReviewWorkflowPhase.Activity,
+            ReviewAgentStageStatus.Completed,
+            "No human activity",
+            startedAt.AddMinutes(1).AddSeconds(6));
+        progress = progress.Apply(
+            ReviewWorkflowPhase.Publication,
+            ReviewAgentStageStatus.Completed,
+            "Draft ready",
+            startedAt.AddMinutes(1).AddSeconds(7));
+        progress = progress.Finish(
+            ReviewPipelineStatus.Completed,
+            2,
+            "draft ready",
+            startedAt.AddMinutes(1).AddSeconds(7));
+        journal.ObserveReview(progress);
+
+        var restored = new DashboardActivityJournal(path).Snapshot();
+        Equal(2, restored.Count, "journal entry count");
+        var review = restored[0];
+        Equal(JournalOperationStatus.Completed, review.Status, "review journal status");
+        Equal(
+            "Queued,Check eligibility,Prepare worktree,Codex,Recheck activity,Prepare GitHub review",
+            string.Join(',', review.Steps.Select(step => step.Title)),
+            "review journal step order");
+        Assert(review.Steps.Any(step => step.Detail?.Contains("gpt-test / high", StringComparison.Ordinal) == true), "agent model and effort missing from journal");
+        Equal(JournalOperationStatus.Completed, restored[1].Status, "refresh journal status");
+        Equal(JournalStepStatus.Completed, restored[1].Steps[^1].Status, "refresh apply step status");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+async Task TestProcessOutputEncodingAsync()
+{
+    var processPath = Environment.ProcessPath
+        ?? throw new InvalidOperationException("Could not locate the test process executable");
+    var arguments = new List<string>();
+    if (string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet", StringComparison.OrdinalIgnoreCase))
+    {
+        arguments.Add(System.Reflection.Assembly.GetEntryAssembly()?.Location
+            ?? throw new InvalidOperationException("Could not locate the test assembly"));
+    }
+
+    arguments.Add("--utf8-output-holder");
+    var result = await ProcessRunner.RunAsync(
+        processPath,
+        arguments,
+        Directory.GetCurrentDirectory(),
+        input: null,
+        timeout: TimeSpan.FromSeconds(30),
+        eligibilityCheckInterval: null,
+        stillEligible: null,
+        CancellationToken.None);
+    Equal(0, result.ExitCode, "UTF-8 helper exit code");
+    Equal("output\u2014text", result.StandardOutput, "UTF-8 standard output");
+    Equal("error\u2014text", result.StandardError, "UTF-8 standard error");
 }
 
 Task TestCodexSchemaEncodingAsync()
@@ -903,6 +1673,32 @@ Task TestDeepSeekStructuredOutputAsync()
     return Task.CompletedTask;
 }
 
+Task TestOpenCodeStructuredOutputAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var resultPath = Path.Combine(directory, "opencode-result.json");
+        var review = LocalReviewAgent.ParseOpenCodeResult(
+            """
+            {"type":"step_start","sessionID":"ses_test","part":{"type":"step-start"}}
+            {"type":"text","sessionID":"ses_test","part":{"type":"text","text":"{\"summary\":\"No additional issues\",\"findings\":[]}"}}
+            {"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish"}}
+            """,
+            resultPath);
+        Equal("No additional issues", review.Summary, "OpenCode review summary");
+        Equal(0, review.Findings.Count, "OpenCode review findings");
+        Assert(File.Exists(resultPath), "OpenCode structured result was not persisted");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
 async Task TestCollaborativeReviewPipelineAsync()
 {
     var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
@@ -949,7 +1745,7 @@ async Task TestCollaborativeReviewPipelineAsync()
         Equal(2, outcome.SuccessfulAgentCount, "successful collaborative agents");
         Equal("codex+kimi", outcome.SuccessfulAgentNames, "successful collaborative agent names");
         Equal("CK", CodexReviewedPullRequest.AgentLettersFor(outcome.SuccessfulAgentNames), "successful agent title letters");
-        Equal("CcKD", CodexReviewedPullRequest.AgentLettersFor("codex+claude+kimi+deepcode"), "all agent title letters");
+        Equal("CcKDO", CodexReviewedPullRequest.AgentLettersFor("codex+claude+kimi+deepcode+opencode"), "all agent title letters");
         Equal(1, outcome.FailedAgentCount, "failed collaborative agents");
         Equal(2, outcome.Result.Findings.Count, "deduplicated collaborative findings");
         Equal("1/3:codex,2/3:claude,3/3:kimi", string.Join(',', started), "pipeline order");
@@ -1006,10 +1802,11 @@ async Task TestCollaborativeReviewPipelineAsync()
                 CancellationToken.None);
             throw new InvalidOperationException("an all-agent failure was accepted as a completed review");
         }
-        catch (InvalidOperationException ex) when (ex.Message.StartsWith("All enabled review agents failed:", StringComparison.Ordinal))
+        catch (AllReviewAgentsFailedException ex)
         {
-            Assert(ex.Message.Contains("codex", StringComparison.Ordinal), "all-agent error omitted Codex");
-            Assert(ex.Message.Contains("kimi", StringComparison.Ordinal), "all-agent error omitted Kimi");
+            Equal(3, ex.Failures.Count, "all-agent failure details");
+            Assert(ex.Failures.Any(failure => failure.Agent == "codex"), "all-agent details omitted Codex");
+            Assert(ex.Failures.Any(failure => failure.Agent == "kimi"), "all-agent details omitted Kimi");
         }
 
         var resetAttempts = 0;
@@ -1078,6 +1875,7 @@ async Task TestReviewWorktreeResetAsync()
         await GitInAsync(repository, "init");
         await GitInAsync(repository, "config", "user.name", "Pr Tests");
         await GitInAsync(repository, "config", "user.email", "pr-tests@example.invalid");
+        await GitInAsync(repository, "config", "core.longPaths", "false");
         File.WriteAllText(Path.Combine(repository, ".gitignore"), "bin/\n");
         File.WriteAllText(Path.Combine(repository, "tracked.txt"), "original\n");
         await GitInAsync(repository, "add", ".gitignore", "tracked.txt");
@@ -1143,6 +1941,55 @@ async Task TestReviewWorktreeResetAsync()
         {
         }
 
+        await AssertRestoredAsync(expectedHead, ledger);
+
+        var lockedPath = Path.Combine(worktree, "transient-lock.tmp");
+        File.WriteAllText(lockedPath, "locked");
+        var lockedStream = new FileStream(
+            lockedPath,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None);
+        var releaseLock = Task.Run(async () =>
+        {
+            await Task.Delay(900);
+            lockedStream.Dispose();
+        });
+        try
+        {
+            await ReviewWorktreeReset.RestoreAsync(
+                worktree,
+                worktreesDirectory,
+                expectedHead,
+                ledgerPath,
+                ledger);
+        }
+        finally
+        {
+            lockedStream.Dispose();
+            await releaseLock;
+        }
+
+        Assert(!File.Exists(lockedPath), "transiently locked file survived reset retries");
+        await AssertRestoredAsync(expectedHead, ledger);
+
+        var longDirectory = Path.Combine(worktree, "artifacts");
+        while (Path.Combine(longDirectory, "generated-output.tmp").Length <= 300)
+        {
+            longDirectory = Path.Combine(longDirectory, "generated-segment-with-a-long-name");
+        }
+
+        Directory.CreateDirectory(longDirectory);
+        var longPath = Path.Combine(longDirectory, "generated-output.tmp");
+        File.WriteAllText(longPath, "temporary");
+        Assert(longPath.Length > 260, "long-path reset fixture was not long enough");
+        await ReviewWorktreeReset.RestoreAsync(
+            worktree,
+            worktreesDirectory,
+            expectedHead,
+            ledgerPath,
+            ledger);
+        Assert(!File.Exists(longPath), "long-path build output survived reset");
         await AssertRestoredAsync(expectedHead, ledger);
 
         try
@@ -1246,6 +2093,38 @@ Task TestDeepCodeSafetySettingsAsync()
         Equal(original, File.ReadAllText(settingsPath), "Deep Code project settings were not restored");
         var code = DeepCodeSessions.ProjectCode(directory);
         Assert(code.Length <= 64, "Deep Code project code exceeded its storage limit");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+Task TestDeepCodeSharedSessionReadAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "pr-tests-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var path = Path.Combine(directory, "session.jsonl");
+    File.WriteAllText(path, "{\"role\":\"assistant\",\"content\":\"first\"}\n");
+    try
+    {
+        using var reader = DeepCodeSessions.OpenSharedRead(path);
+        using (var writer = new FileStream(
+            path,
+            FileMode.Append,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete))
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes("{\"role\":\"assistant\",\"content\":\"second\"}\n");
+            writer.Write(bytes);
+            writer.Flush(flushToDisk: true);
+        }
+
+        reader.Position = 0;
+        using var textReader = new StreamReader(reader);
+        Assert(textReader.ReadToEnd().Contains("second", StringComparison.Ordinal), "shared Deep Code reader missed appended session data");
     }
     finally
     {
@@ -1703,6 +2582,7 @@ async Task TestReviewAgentCommandsAsync()
     await CheckVersionAsync("claude", "claude");
     await CheckVersionAsync("kimi", expectedText: null);
     await CheckVersionAsync("deepcode", expectedText: null);
+    await CheckVersionAsync("opencode", expectedText: null);
 
     static async Task CheckVersionAsync(string command, string? expectedText)
     {

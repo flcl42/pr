@@ -34,6 +34,9 @@
                 <Button Text="Stats"
                         Clicked="OnStatsClicked"
                         ToolTipProperties.Text="Show this week's pull request and review totals" />
+                <Button Text="Local review"
+                        Clicked="OnLocalReviewClicked"
+                        ToolTipProperties.Text="Review a local project directory" />
                 <Button Text="Add repo"
                         Style="{StaticResource PrimaryButton}"
                         Clicked="OnAddRepositoryClicked"
@@ -244,6 +247,27 @@
                             StrokeThickness="1"
                             StrokeShape="RoundRectangle 6"
                             Padding="14">
+                        <VerticalStackLayout Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Text="Activity journal" Style="{StaticResource SectionHeading}" />
+                                <ActivityIndicator x:Name="JournalIndicator"
+                                                   Grid.Column="1"
+                                                   WidthRequest="20"
+                                                   HeightRequest="20"
+                                                   Color="{StaticResource AccentColor}" />
+                            </Grid>
+                            <Label x:Name="JournalEmptyLabel"
+                                   Text="No activity recorded yet."
+                                   Style="{StaticResource Caption}" />
+                            <VerticalStackLayout x:Name="JournalEntriesLayout" Spacing="10" />
+                        </VerticalStackLayout>
+                    </Border>
+
+                    <Border BackgroundColor="{StaticResource SurfaceColor}"
+                            Stroke="{StaticResource BorderColor}"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 6"
+                            Padding="14">
                         <VerticalStackLayout Spacing="9">
                             <Label Text="Automated review" Style="{StaticResource SectionHeading}" />
                             <Grid ColumnDefinitions="*,Auto">
@@ -264,41 +288,14 @@
                                         Grid.Column="1"
                                         Toggled="OnAutoSubmitToggled" />
                             </Grid>
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Text="Agents" FontAttributes="Bold" />
+                                <Label Grid.Column="1" Text="model / effort" Style="{StaticResource Caption}" />
+                            </Grid>
+                            <VerticalStackLayout x:Name="ReviewAgentOptionsLayout" Spacing="2" />
                             <Label x:Name="AgentPipelineLabel" Style="{StaticResource Caption}" />
                             <Label x:Name="ReviewStatusLabel" LineBreakMode="WordWrap" />
                             <Label x:Name="ReviewQueueLabel" Style="{StaticResource Caption}" />
-                        </VerticalStackLayout>
-                    </Border>
-
-                    <Border BackgroundColor="{StaticResource SurfaceColor}"
-                            Stroke="{StaticResource BorderColor}"
-                            StrokeThickness="1"
-                            StrokeShape="RoundRectangle 6"
-                            Padding="14">
-                        <VerticalStackLayout Spacing="8">
-                            <Grid ColumnDefinitions="*,Auto">
-                                <Label Text="Review pipeline" Style="{StaticResource SectionHeading}" />
-                                <ActivityIndicator x:Name="PipelineIndicator"
-                                                   Grid.Column="1"
-                                                   WidthRequest="20"
-                                                   HeightRequest="20"
-                                                   Color="{StaticResource AccentColor}" />
-                            </Grid>
-                            <Label x:Name="PipelineEmptyLabel"
-                                   Text="No review pipeline has run in this session."
-                                   Style="{StaticResource Caption}" />
-                            <VerticalStackLayout x:Name="PipelinePanel" Spacing="7" IsVisible="False">
-                                <Label x:Name="PipelinePullRequestLabel"
-                                       TextColor="{StaticResource AccentColor}"
-                                       TextDecorations="Underline"
-                                       FontAttributes="Bold">
-                                    <Label.GestureRecognizers>
-                                        <TapGestureRecognizer Tapped="OnPipelinePullRequestTapped" />
-                                    </Label.GestureRecognizers>
-                                </Label>
-                                <Label x:Name="PipelineStatusLabel" />
-                                <VerticalStackLayout x:Name="PipelineStagesLayout" Spacing="6" />
-                            </VerticalStackLayout>
                         </VerticalStackLayout>
                     </Border>
 
