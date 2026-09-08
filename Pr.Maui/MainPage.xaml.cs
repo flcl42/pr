@@ -601,7 +601,22 @@ public partial class MainPage : ContentPage
             return;
         }
 
-        var result = _dashboard.EnqueueCodexReview(_selected.Source.PullRequest);
+        var pullRequest = _selected.Source.PullRequest;
+        var allowExternalContributor = false;
+        if (pullRequest.IsExternalContributor)
+        {
+            allowExternalContributor = await DisplayAlertAsync(
+                "External contributor",
+                CodexReviewWatcher.ExternalContributorWarning(pullRequest),
+                "Proceed",
+                "Cancel");
+            if (!allowExternalContributor)
+            {
+                return;
+            }
+        }
+
+        var result = _dashboard.EnqueueCodexReview(pullRequest, allowExternalContributor);
         QueueSnapshotRefresh();
         await DisplayAlertAsync(result.Enqueued ? "Review queued" : "Review not queued", result.Message, "Close");
     }

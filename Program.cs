@@ -1114,9 +1114,11 @@ internal sealed class DashboardApp
         return _codexReviewWatcher.IsManuallyQueued(pullRequest.Key);
     }
 
-    internal CodexReviewEnqueueResult EnqueueCodexReview(PullRequestInfo pullRequest)
+    internal CodexReviewEnqueueResult EnqueueCodexReview(
+        PullRequestInfo pullRequest,
+        bool allowExternalContributor = false)
     {
-        return _codexReviewWatcher.Enqueue(pullRequest);
+        return _codexReviewWatcher.Enqueue(pullRequest, allowExternalContributor);
     }
 
     private void ApplyCodexReviewSnapshot(CodexReviewSnapshot snapshot)
@@ -2577,7 +2579,25 @@ internal sealed class DashboardApp
                 return;
             }
 
-            _owner.EnqueueCodexReview(selected);
+            var allowExternalContributor = false;
+            if (selected.IsExternalContributor)
+            {
+                var choice = Tui.MessageBox.Query(
+                    "External contributor",
+                    CodexReviewWatcher.ExternalContributorWarning(selected),
+                    "Cancel",
+                    "Proceed");
+                Tui.Application.Driver.SetCursorVisibility(Tui.CursorVisibility.Invisible);
+                if (choice != 1)
+                {
+                    _table.SetFocus();
+                    return;
+                }
+
+                allowExternalContributor = true;
+            }
+
+            _owner.EnqueueCodexReview(selected, allowExternalContributor);
             Refresh(_isRefreshing, _isCleaning);
         }
 

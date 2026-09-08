@@ -69,7 +69,7 @@ await RunAsync("Deep Code hidden update prompt", TestDeepCodeHiddenUpdatePromptA
 await RunAsync("startup review scan lookback", TestStartupScanLookbackAsync);
 await RunAsync("manual review enqueue persistence", TestManualReviewEnqueueAsync);
 await RunAsync("manual review bypasses policy gates", TestManualReviewPolicyAsync);
-await RunAsync("external contributors cannot be reviewed", TestExternalContributorSafetyAsync);
+await RunAsync("external contributors require a manual confirmation", TestExternalContributorSafetyAsync);
 await RunAsync("activity excludes author and bots", TestActivityFilteringAsync);
 await RunAsync("latest decisive review controls approvals", TestLatestApprovalStateAsync);
 await RunAsync("inline repository context precedence", TestContextPrecedenceAsync);
@@ -2429,10 +2429,28 @@ Task TestExternalContributorSafetyAsync()
         "CONTRIBUTOR");
     Assert(
         !CodexReviewWatcher.IsEligibleForReview(current, current, "flcl42", CodexReviewSettings.Default, isManual: true),
-        "manual review accepted an external contributor");
+        "unconfirmed manual review accepted an external contributor");
+    Assert(
+        CodexReviewWatcher.IsEligibleForReview(
+            current,
+            current,
+            "flcl42",
+            CodexReviewSettings.Default,
+            isManual: true,
+            allowExternalContributor: true),
+        "confirmed manual review rejected an external contributor");
     Assert(
         !CodexReviewWatcher.IsEligibleForReview(current, current, "flcl42", CodexReviewSettings.Default, isManual: false),
         "automatic review accepted an external contributor");
+    Assert(
+        !CodexReviewWatcher.IsEligibleForReview(
+            current,
+            current,
+            "flcl42",
+            CodexReviewSettings.Default,
+            isManual: false,
+            allowExternalContributor: true),
+        "automatic review used the manual external-contributor bypass");
 
     var directory = Path.Combine(Path.GetTempPath(), "pr-external-tests-" + Guid.NewGuid().ToString("N"));
     Directory.CreateDirectory(directory);
@@ -2461,7 +2479,32 @@ Task TestExternalContributorSafetyAsync()
             current.AuthorAssociation);
         var result = watcher.Enqueue(dashboardItem);
         Equal(false, result.Enqueued, "external contributor was manually queued");
+        Assert(result.Message.Contains("Confirmation required", StringComparison.Ordinal), "confirmation warning was not returned");
+        Assert(
+            CodexReviewWatcher.ExternalContributorWarning(dashboardItem).Contains("may run tests or other code", StringComparison.Ordinal),
+            "external contributor warning omitted the execution risk");
         Equal(false, watcher.IsManuallyQueued(dashboardItem.Key), "external queue request was persisted");
+
+        var confirmed = watcher.Enqueue(dashboardItem, allowExternalContributor: true);
+        Equal(true, confirmed.Enqueued, confirmed.Message);
+        Equal(true, watcher.IsManuallyQueued(dashboardItem.Key), "confirmed external queue request was not persisted");
+
+        var reloaded = new CodexReviewWatcher(
+            settings.Repositories,
+            settingsPath,
+            () => settings.CodexReview,
+            () => settings.IgnoredPullRequestKeys,
+            _ => { });
+        Equal(true, reloaded.IsManuallyQueued(dashboardItem.Key), "external bypass queue did not survive restart");
+        var stateJson = File.ReadAllText(Path.Combine(directory, ".pr-review", "state.json"));
+        Assert(
+            stateJson.Contains("\"allow_external_contributor\": true", StringComparison.Ordinal),
+            "external contributor bypass was not stored with the manual request");
+        var persistedState = JsonSerializer.Deserialize<CodexReviewState>(stateJson, JsonDefaults.Options);
+        Equal(
+            true,
+            persistedState!.ManualReviewRequests[dashboardItem.Key].AllowExternalContributor,
+            "external contributor bypass did not deserialize from the manual request");
     }
     finally
     {

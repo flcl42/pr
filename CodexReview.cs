@@ -92,16 +92,18 @@ internal sealed class CodexReviewWatcher
         return changed;
     }
 
-    public CodexReviewEnqueueResult Enqueue(PullRequestInfo pullRequest)
+    public CodexReviewEnqueueResult Enqueue(
+        PullRequestInfo pullRequest,
+        bool allowExternalContributor = false)
     {
         var agentName = _getSettings().AgentDisplayName;
         CodexReviewEnqueueResult result;
         lock (_stateGate)
         {
-            if (pullRequest.IsExternalContributor)
+            if (pullRequest.IsExternalContributor && !allowExternalContributor)
             {
                 result = CodexReviewEnqueueResult.Rejected(
-                    $"Review not queued for {pullRequest.Repository.Name}#{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}: author is an external contributor");
+                    $"Confirmation required. {ExternalContributorWarning(pullRequest)}");
             }
             else if (!_repositories.Any(repository =>
                     string.Equals(repository.FullName, pullRequest.Repository.FullName, StringComparison.OrdinalIgnoreCase)))
@@ -116,12 +118,15 @@ internal sealed class CodexReviewWatcher
             }
             else
             {
-                _state.ManualReviewRequests[pullRequest.Key] = CodexManualReviewRequest.From(pullRequest);
+                _state.ManualReviewRequests[pullRequest.Key] = CodexManualReviewRequest.From(
+                    pullRequest,
+                    allowExternalContributor: pullRequest.IsExternalContributor && allowExternalContributor);
                 try
                 {
                     SaveState(_state, StatePath(_getSettings()));
                     result = CodexReviewEnqueueResult.Accepted(
-                        $"{agentName} forced review queued for {pullRequest.Repository.Name}#{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}");
+                        $"{agentName} forced review queued for {pullRequest.Repository.Name}#{pullRequest.Number.ToString(CultureInfo.InvariantCulture)}"
+                        + (pullRequest.IsExternalContributor ? "; external-contributor check bypassed for this review" : ""));
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
                 {
@@ -139,6 +144,13 @@ internal sealed class CodexReviewWatcher
         }
 
         return result;
+    }
+
+    internal static string ExternalContributorWarning(PullRequestInfo pullRequest)
+    {
+        return $"@{pullRequest.Author} is an external contributor ({pullRequest.AuthorAssociation}). "
+            + "Review agents may run tests or other code from this PR in a disposable worktree. "
+            + "Proceed only if you trust the change. This bypass applies only to this manual review.";
     }
 
     public bool IsManuallyQueued(string pullRequestKey)
@@ -210,6 +222,7 @@ internal sealed class CodexReviewWatcher
                         activity,
                         settings,
                         candidate.IsManual,
+                        candidate.AllowExternalContributor,
                         cancellationToken);
                     continue;
                 }
@@ -394,7 +407,9 @@ internal sealed class CodexReviewWatcher
                     activeUser,
                     StringComparer.OrdinalIgnoreCase);
                 record!.ReviewRequested = directlyRequested;
-                if (pullRequest.IsExternalContributor)
+                var allowExternalContributor = isManual
+                    && manualRequest!.AllowExternalContributor;
+                if (pullRequest.IsExternalContributor && !allowExternalContributor)
                 {
                     record.Status = "ignored_external_contributor";
                     record.EligibleSince = null;
@@ -504,7 +519,10 @@ internal sealed class CodexReviewWatcher
                 if (readyAt <= now)
                 {
                     record.Status = "queued";
-                    candidates.Add(new CodexReviewCandidate(pullRequest, isManual));
+                    candidates.Add(new CodexReviewCandidate(
+                        pullRequest,
+                        isManual,
+                        allowExternalContributor));
                     waitingCount++;
                 }
                 else
@@ -675,6 +693,7 @@ internal sealed class CodexReviewWatcher
         CodexReviewActivity initialActivity,
         CodexReviewSettings settings,
         bool isManual,
+        bool allowExternalContributor,
         CancellationToken cancellationToken)
     {
         UpdateRecord(pullRequest.Key, record =>
@@ -699,7 +718,13 @@ internal sealed class CodexReviewWatcher
         string? worktree = null;
         try
         {
-            await EnsureEligibleAsync(pullRequest, activeUser, settings, isManual, cancellationToken);
+            await EnsureEligibleAsync(
+                pullRequest,
+                activeUser,
+                settings,
+                isManual,
+                allowExternalContributor,
+                cancellationToken);
             ApplyPipelineWorkflowStep(
                 pullRequest,
                 ReviewWorkflowPhase.Eligibility,
@@ -726,7 +751,13 @@ internal sealed class CodexReviewWatcher
                 context,
                 settings,
                 isManual,
-                async token => await IsEligibleAsync(pullRequest, activeUser, settings, isManual, token),
+                async token => await IsEligibleAsync(
+                    pullRequest,
+                    activeUser,
+                    settings,
+                    isManual,
+                    allowExternalContributor,
+                    token),
                 agentStarted: null,
                 cancellationToken,
                 stageChanged: update => ApplyPipelineStageUpdate(pullRequest, update));
@@ -737,7 +768,13 @@ internal sealed class CodexReviewWatcher
                 ReviewWorkflowPhase.Activity,
                 ReviewAgentStageStatus.Running,
                 "Checking the current approvals and human discussion");
-            await EnsureEligibleAsync(pullRequest, activeUser, settings, isManual, cancellationToken);
+            await EnsureEligibleAsync(
+                pullRequest,
+                activeUser,
+                settings,
+                isManual,
+                allowExternalContributor,
+                cancellationToken);
             var finalActivity = await GitHubReviewApi.GetActivityAsync(pullRequest, settings, cancellationToken);
             ApplyPipelineWorkflowStep(
                 pullRequest,
@@ -778,6 +815,7 @@ internal sealed class CodexReviewWatcher
                     paths,
                     settings,
                     isManual,
+                    allowExternalContributor,
                     cancellationToken);
             }
             else if (!isManual
@@ -935,9 +973,16 @@ internal sealed class CodexReviewWatcher
         string activeUser,
         CodexReviewSettings settings,
         bool isManual,
+        bool allowExternalContributor,
         CancellationToken cancellationToken)
     {
-        if (!await IsEligibleAsync(original, activeUser, settings, isManual, cancellationToken))
+        if (!await IsEligibleAsync(
+                original,
+                activeUser,
+                settings,
+                isManual,
+                allowExternalContributor,
+                cancellationToken))
         {
             throw new CodexReviewEligibilityException(
                 isManual
@@ -951,13 +996,18 @@ internal sealed class CodexReviewWatcher
         string activeUser,
         CodexReviewSettings settings,
         bool isManual,
+        bool allowExternalContributor,
         CancellationToken cancellationToken)
     {
         if (isManual)
         {
-            if (!IsManuallyQueued(original.Key))
+            lock (_stateGate)
             {
-                return false;
+                if (!_state.ManualReviewRequests.TryGetValue(original.Key, out var request)
+                    || request.AllowExternalContributor != allowExternalContributor)
+                {
+                    return false;
+                }
             }
         }
         else if (!_getSettings().Enabled || _getIgnoredPullRequestKeys().Contains(original.Key))
@@ -977,7 +1027,13 @@ internal sealed class CodexReviewWatcher
                 original.Repository,
                 original.Number,
                 cancellationToken);
-            return IsEligibleForReview(original, current, activeUser, settings, isManual);
+            return IsEligibleForReview(
+                original,
+                current,
+                activeUser,
+                settings,
+                isManual,
+                allowExternalContributor);
         }
         catch (OperationCanceledException)
         {
@@ -994,11 +1050,12 @@ internal sealed class CodexReviewWatcher
         CodexPullRequest current,
         string activeUser,
         CodexReviewSettings settings,
-        bool isManual)
+        bool isManual,
+        bool allowExternalContributor = false)
     {
         if (!current.IsOpen
             || !string.Equals(current.HeadOid, original.HeadOid, StringComparison.Ordinal)
-            || current.IsExternalContributor)
+            || (current.IsExternalContributor && !(isManual && allowExternalContributor)))
         {
             return false;
         }
@@ -1345,7 +1402,7 @@ internal sealed class CodexReviewWatcher
                 state.ManualReviewRequests ?? [],
                 StringComparer.OrdinalIgnoreCase);
             state.InitializedRepositories ??= [];
-            state.Version = 3;
+            state.Version = 4;
             return state;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
@@ -1567,6 +1624,7 @@ internal static class GitHubReviewApi
         ReviewPaths paths,
         CodexReviewSettings settings,
         bool isManual,
+        bool allowExternalContributor,
         CancellationToken cancellationToken)
     {
         var current = await GetPullRequestAsync(
@@ -1574,7 +1632,13 @@ internal static class GitHubReviewApi
             pullRequest.Number,
             cancellationToken);
         var activeUser = await GetCurrentUserAsync(cancellationToken);
-        if (!CodexReviewWatcher.IsEligibleForReview(pullRequest, current, activeUser, settings, isManual))
+        if (!CodexReviewWatcher.IsEligibleForReview(
+                pullRequest,
+                current,
+                activeUser,
+                settings,
+                isManual,
+                allowExternalContributor))
         {
             throw new CodexReviewEligibilityException("PR is no longer eligible for publication");
         }
@@ -3984,7 +4048,7 @@ internal sealed class CodexReviewFinding
 
 internal sealed class CodexReviewState
 {
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
     public DateTimeOffset? InitializedAt { get; set; }
     public List<string> InitializedRepositories { get; set; } = [];
     public DateTimeOffset? LastPollAt { get; set; }
@@ -3999,14 +4063,17 @@ internal sealed record CodexManualReviewRequest(
     int Number,
     string Url,
     string Title,
-    DateTimeOffset RequestedAt)
+    DateTimeOffset RequestedAt,
+    bool AllowExternalContributor = false)
 {
     [JsonIgnore]
     public string DisplayName => RepositoryRef.TryParse(RepositoryFullName, out var repository)
         ? $"{repository.Name}#{Number.ToString(CultureInfo.InvariantCulture)}"
         : Key;
 
-    public static CodexManualReviewRequest From(PullRequestInfo pullRequest)
+    public static CodexManualReviewRequest From(
+        PullRequestInfo pullRequest,
+        bool allowExternalContributor = false)
     {
         return new CodexManualReviewRequest(
             pullRequest.Key,
@@ -4014,7 +4081,8 @@ internal sealed record CodexManualReviewRequest(
             pullRequest.Number,
             pullRequest.Url,
             pullRequest.Title,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            allowExternalContributor);
     }
 }
 
@@ -4517,7 +4585,10 @@ internal sealed record ReviewStageProgress(
     }
 }
 
-internal sealed record CodexReviewCandidate(CodexPullRequest PullRequest, bool IsManual);
+internal sealed record CodexReviewCandidate(
+    CodexPullRequest PullRequest,
+    bool IsManual,
+    bool AllowExternalContributor);
 
 internal sealed record CodexReviewReconciliation(
     string ActiveUser,

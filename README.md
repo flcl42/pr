@@ -170,11 +170,13 @@ Press `E` to force an immediate agent review of the selected PR. Manual queue
 entries are persisted in `.pr-review/state.json` and run even while automatic
 review is off. A forced review bypasses the timer, direct-review-request,
 draft, own-PR, ignore, previous-review, approval, and commenter gates. It still
-requires a tracked, open PR from an `OWNER`, `MEMBER`, or `COLLABORATOR`, and
-cancels if the head commit or authenticated user changes. PRs from external
-contributors are never queued, including through `E`. Forced reviews stage
-only actionable findings; a clean result creates nothing. With automatic review
-off, the worker resolves only manually queued PRs.
+requires a tracked, open PR and cancels if the head commit or authenticated user
+changes. Requesting a manual review for an external contributor displays a
+warning that agents may execute code or tests from the PR. Proceeding stores an
+external-contributor bypass on that manual queue entry only; canceling leaves it
+unqueued. Automatic review never bypasses this check. Forced reviews stage only
+actionable findings; a clean result creates nothing. With automatic review off,
+the worker resolves only manually queued PRs.
 
 Press `A` to switch review delivery between drafts and automatic submission. The
 choice is persisted as `codexReview.autoSubmit`; it affects both automatic and
